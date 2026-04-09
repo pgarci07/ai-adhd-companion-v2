@@ -1,0 +1,20 @@
+# Win11 optimized
+# Simply start the environment with: docker compose up
+
+services:
+  ai-adhd-companion-app:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    image: ai-adhd-companion:latest
+    container_name: ai_adhd_companion_dev
+    ports:
+      - "8501:8501"
+    env_file:
+      - ../../.env
+    volumes:
+      - ../../app:/app/app
+    environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+    restart: always
