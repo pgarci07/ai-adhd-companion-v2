@@ -5,7 +5,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, date
 import pytz # Recomendado para manejo de zonas horarias
 from app.application.use_cases.personas_catalog import PERSONAS, supabase
 
@@ -28,16 +28,10 @@ if "current_page" not in st.session_state:
 # --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(page_title="AI-ADHD", layout="centered")
 
-# función para convertir un string a datetime, lo he incluido como una forma
-# sencilla de convertir cosas como "1997" a algo insertable en Supabase TIMESTAMPTZ
-# pero si Streamlit tiene algun control que ya se convierta una caja st.text_input
-# en un date picker pues no se necesitaria
-def to_supabase_timestamp(year_str):
-    # Convertimos el string "1969" a un objeto datetime (1 de Enero a las 00:00)
-    # y le asignamos la zona horaria UTC
-    dt = datetime.strptime(year_str, "%Y").replace(tzinfo=pytz.UTC)    
-    # Retornamos el formato ISO 8601 que Supabase ama
-    return dt.isoformat()
+def to_supabase_date(date_value):
+    if not date_value:
+        return None
+    return date_value.isoformat()
 
 
 def combine_date_and_time(selected_date, selected_time):
@@ -254,6 +248,17 @@ def save_user_profile_updates(preferences_updates=None, state_id=None):
     return refreshed_profile
 
 
+def should_prompt_welcome_dialog():
+    if not st.session_state.get("user_id"):
+        return False
+
+    if st.session_state.get("show_welcome_dialog"):
+        return True
+
+    user_profile = ensure_user_profile_cache()
+    return user_profile.get("state_id") is None
+
+
 ensure_lookup_cache()
 ensure_states_cache()
 
@@ -427,6 +432,84 @@ def format_lookup_option(item):
 
 def format_state_option(item):
     return f"{item['name']} - {item['self_describing']}"
+
+
+def parse_datetime_value(value):
+    parsed = parse_task_datetime(value)
+    if parsed is None:
+        return None
+    return parsed.astimezone(pytz.UTC)
+
+
+def parse_rrule_components(rrule_value):
+    components = {}
+    if not rrule_value:
+        return components
+
+    for part in rrule_value.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        components[key] = value
+
+    return components
+
+
+def get_option_index(options, selected_id):
+    for index, option in enumerate(options):
+        if option["id"] == selected_id:
+            return index
+    return None
+
+
+def update_single_task_instance(task_row, start_at_value, due_at_value, mark_as_exception):
+    instance_payload = {
+        "start_date": start_at_value.isoformat(),
+        "due_date": due_at_value.isoformat(),
+    }
+
+    if mark_as_exception:
+        instance_payload.update(
+            {
+                "is_exception": True,
+                "original_start_date": task_row["start_date"],
+                "original_due_date": task_row["due_date"],
+            }
+        )
+    else:
+        instance_payload.update(
+            {
+                "is_exception": False,
+                "original_start_date": start_at_value.isoformat(),
+                "original_due_date": due_at_value.isoformat(),
+            }
+        )
+
+    (
+        supabase.table("task_instances")
+        .update(instance_payload)
+        .eq("id", task_row["instance_id"])
+        .execute()
+    )
+
+
+def update_task_series(task_row, task_payload, start_at_value, due_at_value):
+    supabase.rpc(
+        "update_task_series_from_instance",
+        {
+            "p_task_id": task_row["task_id"],
+            "p_instance_id": task_row["instance_id"],
+            "p_list_id": task_payload["list_id"],
+            "p_title": task_payload["title"],
+            "p_description": task_payload["description"],
+            "p_rrule": task_payload["rrule"],
+            "p_size_id": task_payload["size_id"],
+            "p_consequence_id": task_payload["consequence_id"],
+            "p_friction_id": task_payload["friction_id"],
+            "p_new_start_date": start_at_value.isoformat(),
+            "p_new_due_date": due_at_value.isoformat(),
+        },
+    ).execute()
 
 
 @st.dialog("Nueva tarea")
@@ -623,6 +706,257 @@ def new_task_form(parent_task=None):
             st.error(f"Error creating task: {e}")
 
 
+@st.dialog("Editar tarea")
+def edit_task_form(task_row):
+    if task_row["status"] in {"completed", "archived"}:
+        st.error("Completed or archived tasks cannot be edited.")
+        return
+
+    user_lists = get_user_lists()
+    list_options = {item["name"]: item["id"] for item in user_lists}
+    list_names = list(list_options.keys())
+    size_options = get_lookup_options("dim_task_sizes")
+    consequence_options = get_lookup_options("dim_task_consequences")
+    friction_options = get_lookup_options("dim_task_frictions")
+    parsed_start = parse_datetime_value(task_row["start_date"]) or datetime.now(pytz.UTC)
+    parsed_due = parse_datetime_value(task_row["due_date"]) or parsed_start
+    rrule_components = parse_rrule_components(task_row.get("rrule"))
+    is_recurrent = bool(task_row.get("rrule"))
+    recurrence_frequency = rrule_components.get("FREQ", "DAILY")
+    recurrence_interval = int(rrule_components.get("INTERVAL", "1"))
+    selected_weekdays = []
+    recurrence_end_date = None
+    weekday_options = {
+        "Monday": "MO",
+        "Tuesday": "TU",
+        "Wednesday": "WE",
+        "Thursday": "TH",
+        "Friday": "FR",
+        "Saturday": "SA",
+        "Sunday": "SU",
+    }
+    reverse_weekday_options = {value: key for key, value in weekday_options.items()}
+    if rrule_components.get("BYDAY"):
+        selected_weekdays = [
+            reverse_weekday_options[day_code]
+            for day_code in rrule_components["BYDAY"].split(",")
+            if day_code in reverse_weekday_options
+        ]
+    if rrule_components.get("UNTIL"):
+        try:
+            recurrence_end_date = datetime.strptime(
+                rrule_components["UNTIL"],
+                "%Y%m%dT%H%M%SZ",
+            ).date()
+        except ValueError:
+            recurrence_end_date = None
+
+    is_series_task = bool(task_row.get("rrule"))
+    apply_scope = "Single task"
+    if is_series_task:
+        apply_scope = st.radio(
+            "Apply changes to",
+            options=["Only this occurrence", "This and future occurrences"],
+            horizontal=True,
+        )
+        if apply_scope == "Only this occurrence":
+            st.info(
+                "This option only updates the selected occurrence dates. "
+                "Task template fields stay unchanged because they belong to the whole series."
+            )
+        else:
+            st.info(
+                "This option updates the task template and shifts future open occurrences. "
+                "Completed, archived, or exception instances are left untouched."
+            )
+    series_fields_disabled = is_series_task and apply_scope == "Only this occurrence"
+
+    current_list_name = next(
+        (name for name, list_id in list_options.items() if list_id == task_row["list_id"]),
+        None,
+    )
+    title = st.text_input("Title", value=task_row["title"], disabled=series_fields_disabled)
+    description = st.text_area(
+        "Description",
+        value=task_row["description"] or "",
+        disabled=series_fields_disabled,
+    )
+
+    if current_list_name and list_names:
+        default_list_index = list_names.index(current_list_name)
+        selected_list_name = st.selectbox(
+            "List",
+            options=list_names,
+            index=default_list_index,
+            disabled=series_fields_disabled,
+        )
+    elif current_list_name:
+        selected_list_name = current_list_name
+        st.text_input("List", value=current_list_name, disabled=True)
+    else:
+        selected_list_name = None
+        st.info("This user does not have any available list yet.")
+
+    start_date = st.date_input("Start date", value=parsed_start.date())
+    start_time = st.time_input("Start time", value=parsed_start.time().replace(tzinfo=None))
+    due_date = st.date_input("Due date", value=parsed_due.date(), min_value=start_date)
+    due_time = st.time_input("Due time", value=parsed_due.time().replace(tzinfo=None))
+    selected_size = st.selectbox(
+        "Task size",
+        options=size_options,
+        index=get_option_index(size_options, task_row["size_id"]),
+        format_func=format_lookup_option,
+        disabled=series_fields_disabled,
+    )
+    selected_consequence = st.selectbox(
+        "Consequence",
+        options=consequence_options,
+        index=get_option_index(consequence_options, task_row["consequence_id"]),
+        format_func=format_lookup_option,
+        disabled=series_fields_disabled,
+    )
+    selected_friction = st.selectbox(
+        "Friction",
+        options=friction_options,
+        index=get_option_index(friction_options, task_row["friction_id"]),
+        format_func=format_lookup_option,
+        disabled=series_fields_disabled,
+    )
+
+    if task_row["parent_task_id"]:
+        st.caption("Subtasks cannot be recurrent.")
+        is_recurrent = False
+    elif series_fields_disabled:
+        st.caption("Recurrence settings can only be changed for this and future occurrences.")
+    else:
+        is_recurrent = st.checkbox("Recurrent task", value=is_recurrent)
+
+    if is_recurrent and not series_fields_disabled:
+        frequency_options = ["DAILY", "WEEKLY", "MONTHLY"]
+        recurrence_frequency = st.selectbox(
+            "Frequency",
+            options=frequency_options,
+            index=frequency_options.index(recurrence_frequency) if recurrence_frequency in frequency_options else 0,
+        )
+        recurrence_interval = st.number_input(
+            "Repeat every",
+            min_value=1,
+            value=int(recurrence_interval),
+            step=1,
+        )
+
+        if recurrence_frequency == "WEEKLY":
+            default_weekdays = selected_weekdays or [start_date.strftime("%A")]
+            selected_weekdays = st.multiselect(
+                "Week days",
+                options=list(weekday_options.keys()),
+                default=default_weekdays,
+            )
+
+        has_end_date = st.checkbox(
+            "Set recurrence end date",
+            value=recurrence_end_date is not None,
+        )
+        if has_end_date:
+            recurrence_end_date = st.date_input(
+                "Recurrence end date",
+                value=recurrence_end_date or due_date,
+                min_value=start_date,
+            )
+        else:
+            recurrence_end_date = None
+
+    if st.button("Save task changes", type="primary", use_container_width=True):
+        try:
+            start_at_value = combine_date_and_time_value(start_date, start_time)
+            due_at_value = combine_date_and_time_value(due_date, due_time)
+            if due_at_value < start_at_value:
+                st.error("Due date must be later than or equal to start date.")
+                return
+
+            if is_series_task and apply_scope == "Only this occurrence":
+                update_single_task_instance(
+                    task_row=task_row,
+                    start_at_value=start_at_value,
+                    due_at_value=due_at_value,
+                    mark_as_exception=True,
+                )
+            else:
+                list_id = list_options.get(selected_list_name)
+                if not list_id:
+                    st.error("No list is available for this user yet.")
+                    return
+
+                if not title.strip():
+                    st.error("Title is required.")
+                    return
+
+                size_id = selected_size["id"] if selected_size else None
+                consequence_id = selected_consequence["id"] if selected_consequence else None
+                friction_id = selected_friction["id"] if selected_friction else None
+                if not size_id or not consequence_id or not friction_id:
+                    st.error("Select a size, a consequence, and a friction level.")
+                    return
+
+                if is_recurrent and recurrence_frequency == "WEEKLY" and not selected_weekdays:
+                    st.error("Select at least one week day for a weekly recurrent task.")
+                    return
+
+                recurrence_until = None
+                if recurrence_end_date:
+                    recurrence_until = combine_date_and_time_value(recurrence_end_date, due_time)
+                    if recurrence_until < start_at_value:
+                        st.error("Recurrence end date must be later than the start date.")
+                        return
+
+                rrule_value = None
+                if is_recurrent:
+                    rrule_value = build_rrule(
+                        frequency=recurrence_frequency,
+                        interval_value=int(recurrence_interval),
+                        byweekday_values=[
+                            weekday_options[day_name] for day_name in selected_weekdays
+                        ],
+                        until_value=recurrence_until,
+                    )
+
+                task_payload = {
+                    "list_id": list_id,
+                    "title": title.strip(),
+                    "description": description.strip() or None,
+                    "rrule": rrule_value,
+                    "size_id": size_id,
+                    "consequence_id": consequence_id,
+                    "friction_id": friction_id,
+                }
+
+                if is_series_task and apply_scope == "This and future occurrences":
+                    update_task_series(
+                        task_row=task_row,
+                        task_payload=task_payload,
+                        start_at_value=start_at_value,
+                        due_at_value=due_at_value,
+                    )
+                else:
+                    (
+                        supabase.table("tasks")
+                        .update(task_payload)
+                        .eq("id", task_row["task_id"])
+                        .execute()
+                    )
+                    update_single_task_instance(
+                        task_row=task_row,
+                        start_at_value=start_at_value,
+                        due_at_value=due_at_value,
+                        mark_as_exception=False,
+                    )
+
+            st.success("Task updated successfully.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error updating task: {e}")
+
+
 @st.dialog("Task details")
 def task_details_dialog(task_row):
     st.subheader(task_row["title"])
@@ -679,8 +1013,25 @@ def render_tasks_page():
             st.info("You do not have any tasks yet.")
             return
 
+        preferred_column_order = [
+            "display_start_date",
+            "display_due_date",
+            "title",
+        ]
+        remaining_columns = [
+            column_name
+            for column_name in tasks_df.columns
+            if column_name not in preferred_column_order
+        ]
+        show_all_columns = st.toggle("Show all task fields", value=False)
+        visible_columns = (
+            preferred_column_order + remaining_columns
+            if show_all_columns
+            else preferred_column_order
+        )
+
         st.dataframe(
-            tasks_df[["title", "display_due_date", "display_start_date", "status"]],
+            tasks_df[visible_columns],
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -688,6 +1039,9 @@ def render_tasks_page():
                 "display_due_date": "Due date",
                 "display_start_date": "Start date",
                 "status": "Status",
+                "WOBJ": "WOBJ",
+                "WSUB": "WSUB",
+                "Urgency": "Urgency",
             },
         )
 
@@ -705,8 +1059,12 @@ def render_tasks_page():
 
             action_col1, action_col2, action_col3, action_col4 = st.columns(4)
             with action_col1:
-                if st.button("View full details", use_container_width=True):
-                    task_details_dialog(selected_row)
+                if st.button(
+                    "Edit task",
+                    use_container_width=True,
+                    disabled=selected_row["status"] in {"completed", "archived"},
+                ):
+                    edit_task_form(selected_row)
             with action_col2:
                 if st.button("Delete task", use_container_width=True):
                     delete_task(selected_row)
@@ -902,7 +1260,12 @@ def registration_form():
         password = st.text_input("Contraseña", type="password")
 	    #
         # TO-DO: Meter aqui en el form los controles de los campos del usuario que necesitamos
-        born = st.text_input("Birth date")
+        born = st.date_input(
+            "Birth date",
+            value=date(2000, 1, 1),
+            min_value=date(1900, 1, 1),
+            max_value=date.today(),
+        )
         persona_options = {
             persona["name"]: persona_id for persona_id, persona in PERSONAS.items()
         }
@@ -945,7 +1308,7 @@ def registration_form():
                         "time-mgmt":"Pomodoro",
                         "notifications": True,
                     }
-                    born_date = to_supabase_timestamp(born)
+                    born_date = to_supabase_date(born)
 
                     # 2. Insertar en la tabla 'profiles' de tu DDL
                     profile_res = supabase.table("profiles").insert({
@@ -957,8 +1320,14 @@ def registration_form():
                         "persona_id": persona_id,
                         "state_id": None                
                     }).execute()
+
+                    refresh_user_profile_cache()
+                    st.session_state["session_expected_work_time"] = None
+                    st.session_state["show_welcome_dialog"] = True
+                    st.session_state["current_page"] = "tasks"
                     
                     st.success("Registro completado y ID guardado en sesión. Mira en tu buzón para completar el registro.")
+                    st.rerun()
           
             except Exception as e:
                 st.error(f"Error en el registro: {e}")
@@ -1010,7 +1379,8 @@ if st.session_state["user_id"]:
     # ESTO ES LO QUE VE EL USUARIO LOGUEADO
     render_sidebar()
 
-    if st.session_state.get("show_welcome_dialog"):
+    if should_prompt_welcome_dialog():
+        st.session_state["show_welcome_dialog"] = True
         welcome_session_dialog()
 
     if st.session_state.get("current_page") == "preferences":
