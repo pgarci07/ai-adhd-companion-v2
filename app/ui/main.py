@@ -72,6 +72,31 @@ def format_task_datetime(value):
         return str(value)
 
 
+def is_expired_jwt_error(error):
+    error_text = str(error)
+    return "JWT expired" in error_text or "PGRST303" in error_text
+
+
+def handle_api_exception(error, fallback_message="Could not complete the request."):
+    if is_expired_jwt_error(error):
+        try:
+            supabase.auth.sign_out()
+        except Exception:
+            pass
+
+        st.session_state["user_id"] = None
+        st.session_state.pop("user_profile", None)
+        st.session_state["session_expected_work_time"] = None
+        st.session_state["show_welcome_dialog"] = False
+        st.session_state["current_page"] = "tasks"
+        st.error("Your session expired. Please sign in again.")
+        st.rerun()
+        return True
+
+    st.error(fallback_message)
+    return False
+
+
 def get_user_lists():
     response = (
         supabase.table("lists")
@@ -149,8 +174,39 @@ def get_states_options():
     return st.session_state["states_cache"]
 
 
+def extract_first_name(full_name):
+    if not full_name:
+        return None
+
+    parts = str(full_name).strip().split()
+    if not parts:
+        return None
+    return parts[0]
+
+
+def calculate_age(born_value):
+    if not born_value:
+        return None
+
+    try:
+        born_date = born_value if isinstance(born_value, date) else date.fromisoformat(str(born_value))
+    except ValueError:
+        return None
+
+    today = datetime.now(pytz.UTC).date()
+    age = today.year - born_date.year
+    if (today.month, today.day) < (born_date.month, born_date.day):
+        age -= 1
+    return age
+
+
 def load_user_profile_cache():
     default_profile = {
+        "full_name": None,
+        "first_name": None,
+        "role": "user",
+        "born": None,
+        "age": None,
         "state_id": None,
         "preferences": {
             "average_session_time": 120,
@@ -166,7 +222,7 @@ def load_user_profile_cache():
     try:
         response = (
             supabase.table("profiles")
-            .select("state_id, preferences")
+            .select("full_name, role, born, state_id, preferences")
             .eq("id", user_id)
             .limit(1)
             .execute()
@@ -181,6 +237,11 @@ def load_user_profile_cache():
         custom_sizes = default_profile["preferences"]["custom_sizes"]
 
     normalized_profile = {
+        "full_name": profile.get("full_name"),
+        "first_name": extract_first_name(profile.get("full_name")),
+        "role": profile.get("role") or default_profile["role"],
+        "born": profile.get("born"),
+        "age": calculate_age(profile.get("born")),
         "state_id": profile.get("state_id"),
         "preferences": {
             **preferences,
@@ -311,7 +372,7 @@ def get_task_rows():
             "id, task_id, instance_number, parent_instance_id, start_date, due_date, "
             "status, "
             "tasks!inner(id, list_id, title, description, parent_task_id, rrule, "
-            "is_active, size_id, consequence_id, friction_id, is_adaptive)"
+            "is_active, is_routine, size_id, consequence_id, friction_id, is_adaptive)"
         )
         .order("due_date", desc=True)
         .execute()
@@ -334,6 +395,7 @@ def get_task_rows():
                 "status": row.get("status", "-"),
                 "rrule": task_payload.get("rrule"),
                 "is_active": task_payload.get("is_active"),
+                "is_routine": task_payload.get("is_routine"),
                 "size_id": task_payload.get("size_id"),
                 "consequence_id": task_payload.get("consequence_id"),
                 "friction_id": task_payload.get("friction_id"),
@@ -443,7 +505,23 @@ def parse_datetime_value(value):
 
 def parse_rrule_components(rrule_value):
     components = {}
-    if not rrule_value:
+    try:
+        if rrule_value is None or pd.isna(rrule_value):
+            return components
+    except Exception:
+        if rrule_value is None:
+            return components
+
+    if isinstance(rrule_value, float):
+        return components
+
+    if isinstance(rrule_value, str) and rrule_value.lower() == "nan":
+        return components
+
+    if not isinstance(rrule_value, str):
+        rrule_value = str(rrule_value)
+
+    if not rrule_value.strip():
         return components
 
     for part in rrule_value.split(";"):
@@ -460,6 +538,10 @@ def get_option_index(options, selected_id):
         if option["id"] == selected_id:
             return index
     return None
+
+
+def has_rrule_value(rrule_value):
+    return bool(parse_rrule_components(rrule_value))
 
 
 def update_single_task_instance(task_row, start_at_value, due_at_value, mark_as_exception):
@@ -720,8 +802,9 @@ def edit_task_form(task_row):
     friction_options = get_lookup_options("dim_task_frictions")
     parsed_start = parse_datetime_value(task_row["start_date"]) or datetime.now(pytz.UTC)
     parsed_due = parse_datetime_value(task_row["due_date"]) or parsed_start
-    rrule_components = parse_rrule_components(task_row.get("rrule"))
-    is_recurrent = bool(task_row.get("rrule"))
+    rrule_raw_value = task_row.get("rrule")
+    rrule_components = parse_rrule_components(rrule_raw_value)
+    is_recurrent = has_rrule_value(rrule_raw_value)
     recurrence_frequency = rrule_components.get("FREQ", "DAILY")
     recurrence_interval = int(rrule_components.get("INTERVAL", "1"))
     selected_weekdays = []
@@ -976,6 +1059,7 @@ def task_details_dialog(task_row):
         "Consequence ID": task_row["consequence_id"],
         "Friction ID": task_row["friction_id"],
         "Active": task_row["is_active"],
+        "Routine": task_row.get("is_routine"),
         "Adaptive": task_row["is_adaptive"],
         "Priority": task_row.get("priority_label"),
         "WOBJ": task_row.get("WOBJ"),
@@ -987,9 +1071,87 @@ def task_details_dialog(task_row):
         st.write(f"**{label}:** {value}")
 
 
-def delete_task(task_row):
-    supabase.table("task_instances").delete().eq("task_id", task_row["task_id"]).execute()
-    supabase.table("tasks").delete().eq("id", task_row["task_id"]).execute()
+def get_delete_task_context(task_row):
+    response = supabase.rpc(
+        "get_task_delete_context",
+        {
+            "p_task_id": task_row["task_id"],
+            "p_instance_id": task_row["instance_id"],
+        },
+    ).execute()
+    return response.data or {}
+
+
+@st.dialog("Delete task")
+def delete_task_dialog(task_row):
+    try:
+        context = get_delete_task_context(task_row)
+    except Exception as e:
+        handle_api_exception(e, f"Could not inspect delete impact: {e}")
+        return
+
+    is_recurring = bool(context.get("is_recurring"))
+    has_subtasks = bool(context.get("has_subtasks"))
+    allow_all = bool(context.get("allow_all"))
+    all_worthy_count = int(context.get("all_worthy_count", 0) or 0)
+    current_family_worthy = bool(context.get("current_family_worthy"))
+
+    st.write(f"Delete target: **{task_row['title']}**")
+
+    delete_scope = "current"
+    if is_recurring:
+        scope_options = {
+            "Current one": "current",
+            "Future ones (including current)": "future",
+        }
+        if allow_all:
+            scope_options["All"] = "all"
+
+        selected_scope_label = st.radio(
+            "Choose what to delete",
+            options=list(scope_options.keys()),
+        )
+        delete_scope = scope_options[selected_scope_label]
+
+    if delete_scope == "current" and current_family_worthy:
+        st.warning(
+            "This selected occurrence has valuable completed data"
+            + (" in itself or in its subtasks." if has_subtasks else ".")
+        )
+
+    keep_worthy = False
+    if delete_scope == "all" and all_worthy_count > 0:
+        st.warning(
+            f"There are {all_worthy_count} valuable completed occurrence(s) in this series."
+        )
+        keep_choice = st.radio(
+            "What do you want to do with those valuable occurrences?",
+            options=["Keep them", "Delete everything"],
+        )
+        keep_worthy = keep_choice == "Keep them"
+
+    confirm_message = {
+        "current": "Delete the selected occurrence",
+        "future": "Delete current and future occurrences",
+        "all": "Delete all selected scope",
+    }[delete_scope]
+    st.caption("This action can affect subtasks automatically through database cascades.")
+
+    if st.button(confirm_message, type="primary", use_container_width=True):
+        try:
+            supabase.rpc(
+                "delete_task_by_policy",
+                {
+                    "p_task_id": task_row["task_id"],
+                    "p_instance_id": task_row["instance_id"],
+                    "p_scope": delete_scope,
+                    "p_keep_worthy": keep_worthy,
+                },
+            ).execute()
+            st.success("Task deleted successfully.")
+            st.rerun()
+        except Exception as e:
+            handle_api_exception(e, f"Could not delete task: {e}")
 
 def update_task_status(task_row, new_status):
     supabase.table("task_instances").update(
@@ -1018,9 +1180,19 @@ def render_tasks_page():
             "display_due_date",
             "title",
         ]
+        show_routines = st.toggle("Show routines", value=False)
+        filtered_tasks_df = tasks_df[
+            tasks_df["is_routine"] == show_routines
+        ].reset_index(drop=True)
+
+        if filtered_tasks_df.empty:
+            empty_label = "routines" if show_routines else "actions"
+            st.info(f"You do not have any {empty_label} yet.")
+            return
+
         remaining_columns = [
             column_name
-            for column_name in tasks_df.columns
+            for column_name in filtered_tasks_df.columns
             if column_name not in preferred_column_order
         ]
         show_all_columns = st.toggle("Show all task fields", value=False)
@@ -1031,7 +1203,7 @@ def render_tasks_page():
         )
 
         st.dataframe(
-            tasks_df[visible_columns],
+            filtered_tasks_df[visible_columns],
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -1047,14 +1219,14 @@ def render_tasks_page():
 
         selected_label = st.selectbox(
             "Select a task",
-            options=tasks_df["selection_label"].tolist(),
+            options=filtered_tasks_df["selection_label"].tolist(),
             index=None,
             placeholder="Choose a task to manage",
         )
 
         if selected_label:
-            selected_row = tasks_df.loc[
-                tasks_df["selection_label"] == selected_label
+            selected_row = filtered_tasks_df.loc[
+                filtered_tasks_df["selection_label"] == selected_label
             ].iloc[0].to_dict()
 
             action_col1, action_col2, action_col3, action_col4 = st.columns(4)
@@ -1067,9 +1239,7 @@ def render_tasks_page():
                     edit_task_form(selected_row)
             with action_col2:
                 if st.button("Delete task", use_container_width=True):
-                    delete_task(selected_row)
-                    st.success("Task deleted successfully.")
-                    st.rerun()
+                    delete_task_dialog(selected_row)
             with action_col3:
                 if st.button("Create subtask", use_container_width=True):
                     new_task_form(parent_task=selected_row)
@@ -1079,7 +1249,7 @@ def render_tasks_page():
                     st.success("Task marked as completed.")
                     st.rerun()
     except Exception as e:
-        st.error(f"Could not load tasks: {e}")
+        handle_api_exception(e, f"Could not load tasks: {e}")
 
 
 def render_preferences_page():
@@ -1161,7 +1331,7 @@ def render_preferences_page():
                 st.success("Preferences updated successfully.")
                 st.rerun()
             except Exception as e:
-                st.error(f"Could not update preferences: {e}")
+                handle_api_exception(e, f"Could not update preferences: {e}")
 
 
 @st.dialog("Bienvenido")
@@ -1171,12 +1341,16 @@ def welcome_session_dialog():
     state_ids = [item["id"] for item in state_options]
     current_state_id = user_profile.get("state_id")
     state_index = None
+    first_name = user_profile.get("first_name")
 
     if current_state_id in state_ids:
         state_index = state_ids.index(current_state_id)
 
     with st.form("welcome_session_form"):
-        st.write("Antes de empezar, cuéntanos cómo llegas a esta sesión.")
+        if first_name:
+            st.write(f"Welcome, {first_name}. Before we start, tell us how you're arriving to this session.")
+        else:
+            st.write("Welcome. Before we start, tell us how you're arriving to this session.")
         selected_state = st.selectbox(
             "State",
             options=state_options,
@@ -1214,7 +1388,7 @@ def welcome_session_dialog():
                 st.success("Sesión preparada.")
                 st.rerun()
             except Exception as e:
-                st.error(f"No se pudo guardar la bienvenida: {e}")
+                handle_api_exception(e, f"No se pudo guardar la bienvenida: {e}")
 
 
 def render_sidebar():
@@ -1377,16 +1551,19 @@ if "user_id" not in st.session_state:
 # --- FLUJO PRINCIPAL ---
 if st.session_state["user_id"]:
     # ESTO ES LO QUE VE EL USUARIO LOGUEADO
-    render_sidebar()
+    try:
+        render_sidebar()
 
-    if should_prompt_welcome_dialog():
-        st.session_state["show_welcome_dialog"] = True
-        welcome_session_dialog()
+        if should_prompt_welcome_dialog():
+            st.session_state["show_welcome_dialog"] = True
+            welcome_session_dialog()
 
-    if st.session_state.get("current_page") == "preferences":
-        render_preferences_page()
-    else:
-        render_tasks_page()
+        if st.session_state.get("current_page") == "preferences":
+            render_preferences_page()
+        else:
+            render_tasks_page()
+    except Exception as e:
+        handle_api_exception(e, f"Error accessing the app: {e}")
 
 else:
     # ESTO ES LA LANDING PAGE
