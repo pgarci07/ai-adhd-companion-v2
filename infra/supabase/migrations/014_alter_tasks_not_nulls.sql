@@ -1,0 +1,8 @@
+ALTER TABLE tasks
+ALTER COLUMN size_id SET NOT NULL;
+
+ALTER TABLE tasks
+ALTER COLUMN consequence_id SET NOT NULL;
+
+ALTER TABLE tasks
+ALTER COLUMN friction_id SET NOT NULL;

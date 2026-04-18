@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
@@ -7,13 +8,20 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, time, timedelta, date
 import pytz # Recomendado para manejo de zonas horarias
+from st_aggrid import AgGrid, GridOptionsBuilder
 from app.application.use_cases.personas_catalog import PERSONAS, supabase
+
+try:
+    from streamlit_cookies_manager import EncryptedCookieManager
+except ImportError:
+    EncryptedCookieManager = None
 
 LOOKUP_TABLES = (
     "dim_task_sizes",
     "dim_task_consequences",
     "dim_task_frictions",
 )
+AUTH_COOKIE_KEY = "supabase_auth_session"
 
 # Inicializo el user id en session state para evitar errores
 if "user_id" not in st.session_state:
@@ -26,7 +34,17 @@ if "current_page" not in st.session_state:
     st.session_state["current_page"] = "tasks"
 
 # --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="AI-ADHD", layout="centered")
+st.set_page_config(page_title="AI-ADHD", layout="wide")
+
+if EncryptedCookieManager:
+    cookies = EncryptedCookieManager(
+        prefix="ai-adhd-companion/",
+        password=os.environ.get("COOKIES_PASSWORD", os.environ.get("SUPABASE_KEY", "ai-adhd-dev-cookie")),
+    )
+    if not cookies.ready():
+        st.stop()
+else:
+    cookies = None
 
 def to_supabase_date(date_value):
     if not date_value:
@@ -42,6 +60,14 @@ def combine_date_and_time(selected_date, selected_time):
 def combine_date_and_time_value(selected_date, selected_time):
     combined = datetime.combine(selected_date, selected_time)
     return combined.replace(tzinfo=pytz.UTC)
+
+
+def get_next_available_time(base_datetime=None):
+    current_dt = base_datetime.astimezone(pytz.UTC) if base_datetime else datetime.now(pytz.UTC)
+    next_hour = current_dt.replace(minute=0, second=0, microsecond=0)
+    if current_dt.minute > 0 or current_dt.second > 0 or current_dt.microsecond > 0:
+        next_hour += timedelta(hours=1)
+    return next_hour.time().replace(tzinfo=None)
 
 
 def build_rrule(
@@ -77,6 +103,81 @@ def is_expired_jwt_error(error):
     return "JWT expired" in error_text or "PGRST303" in error_text
 
 
+def clear_auth_cookie():
+    if cookies is None:
+        return
+
+    try:
+        if AUTH_COOKIE_KEY in cookies:
+            del cookies[AUTH_COOKIE_KEY]
+            cookies.save()
+    except Exception:
+        pass
+
+
+def save_auth_cookie(auth_response):
+    if cookies is None:
+        return
+
+    session = getattr(auth_response, "session", None)
+    if not session:
+        return
+
+    try:
+        cookies[AUTH_COOKIE_KEY] = json.dumps(
+            {
+                "access_token": getattr(session, "access_token", None),
+                "refresh_token": getattr(session, "refresh_token", None),
+            }
+        )
+        cookies.save()
+    except Exception:
+        # A cookie failure should not block a valid login.
+        pass
+
+
+def restore_auth_session_from_cookie():
+    if cookies is None or st.session_state.get("user_id"):
+        return
+
+    raw_session = cookies.get(AUTH_COOKIE_KEY)
+    if not raw_session:
+        return
+
+    if isinstance(raw_session, str):
+        try:
+            raw_session = json.loads(raw_session)
+        except json.JSONDecodeError:
+            clear_auth_cookie()
+            return
+
+    if not isinstance(raw_session, dict):
+        clear_auth_cookie()
+        return
+
+    access_token = raw_session.get("access_token")
+    refresh_token = raw_session.get("refresh_token")
+    if not access_token or not refresh_token:
+        clear_auth_cookie()
+        return
+
+    try:
+        auth_response = supabase.auth.set_session(access_token, refresh_token)
+    except Exception:
+        try:
+            auth_response = supabase.auth.refresh_session(refresh_token)
+        except Exception:
+            clear_auth_cookie()
+            return
+
+    user = getattr(auth_response, "user", None)
+    if not user:
+        clear_auth_cookie()
+        return
+
+    st.session_state["user_id"] = user.id
+
+
 def handle_api_exception(error, fallback_message="Could not complete the request."):
     if is_expired_jwt_error(error):
         try:
@@ -84,6 +185,7 @@ def handle_api_exception(error, fallback_message="Could not complete the request
         except Exception:
             pass
 
+        clear_auth_cookie()
         st.session_state["user_id"] = None
         st.session_state.pop("user_profile", None)
         st.session_state["session_expected_work_time"] = None
@@ -470,20 +572,61 @@ def get_tasks_dataframe():
     # --- display columns ---
     dataframe["display_start_date"] = dataframe["start_date"].apply(format_task_datetime)
     dataframe["display_due_date"] = dataframe["due_date"].apply(format_task_datetime)
+    task_title_map = dataframe.set_index("task_id")["title"].to_dict()
+    dataframe["parent_title"] = dataframe["parent_task_id"].map(task_title_map)
+    dataframe["is_subtask"] = dataframe["parent_task_id"].notna()
+    dataframe["task_type"] = dataframe["is_subtask"].apply(
+        lambda is_subtask: "Subtask" if is_subtask else "Task"
+    )
+    dataframe["display_title"] = dataframe.apply(
+        lambda row: (
+            f"  ↳ {row['title']}"
+            if row["is_subtask"]
+            else row["title"]
+        ),
+        axis=1,
+    )
 
     dataframe["selection_label"] = dataframe.apply(
         lambda row: (
-            f"{row['title']} | {row['priority_label']} | urgency {row['Urgency']} "
+            f"{row['task_type']}: {row['title']} | {row['priority_label']} | urgency {row['Urgency']} "
             f"| due {row['display_due_date']} | {row['status']}"
         ),
         axis=1,
     )
 
-    # --- sort by priority first ---
-    dataframe = dataframe.sort_values(
+    # --- sort parent tasks by priority and keep subtasks under their parent ---
+    sorted_dataframe = dataframe.sort_values(
         by=["Urgency", "due_date"],
         ascending=[False, True]
     ).reset_index(drop=True)
+    children_by_parent = {}
+    ordered_indices = []
+
+    for index, row in sorted_dataframe.iterrows():
+        parent_task_id = row["parent_task_id"]
+        if pd.isna(parent_task_id):
+            ordered_indices.append(index)
+        else:
+            children_by_parent.setdefault(parent_task_id, []).append(index)
+
+    final_indices = []
+
+    def append_task_branch(row_index):
+        final_indices.append(row_index)
+        task_id = sorted_dataframe.iloc[row_index]["task_id"]
+        for child_index in children_by_parent.get(task_id, []):
+            append_task_branch(child_index)
+
+    for parent_index in ordered_indices:
+        append_task_branch(parent_index)
+
+    remaining_indices = [
+        index for index in sorted_dataframe.index
+        if index not in final_indices
+    ]
+    final_indices.extend(remaining_indices)
+    dataframe = sorted_dataframe.iloc[final_indices].reset_index(drop=True)
 
     return dataframe
 
@@ -542,6 +685,34 @@ def get_option_index(options, selected_id):
 
 def has_rrule_value(rrule_value):
     return bool(parse_rrule_components(rrule_value))
+
+
+def get_aggrid_selected_row(grid_response):
+    selected_rows = None
+
+    if hasattr(grid_response, "selected_rows"):
+        selected_rows = grid_response.selected_rows
+    elif isinstance(grid_response, dict):
+        selected_rows = grid_response.get("selected_rows")
+
+    if selected_rows is None:
+        return None
+
+    if isinstance(selected_rows, pd.DataFrame):
+        if selected_rows.empty:
+            return None
+        return selected_rows.iloc[0].to_dict()
+
+    if isinstance(selected_rows, list):
+        if not selected_rows:
+            return None
+        first_row = selected_rows[0]
+        if isinstance(first_row, dict):
+            return first_row
+        if hasattr(first_row, "to_dict"):
+            return first_row.to_dict()
+
+    return None
 
 
 def update_single_task_instance(task_row, start_at_value, due_at_value, mark_as_exception):
@@ -609,6 +780,10 @@ def new_task_form(parent_task=None):
         st.session_state["new_task_due_date"] = st.session_state["new_task_start_date"]
     if "new_task_last_start_date" not in st.session_state:
         st.session_state["new_task_last_start_date"] = st.session_state["new_task_start_date"]
+    if "new_task_start_time" not in st.session_state:
+        st.session_state["new_task_start_time"] = get_next_available_time()
+    if "new_task_due_time" not in st.session_state:
+        st.session_state["new_task_due_time"] = time(17, 0)
 
     parent_task_id = parent_task["task_id"] if parent_task else None
     parent_instance_number = parent_task["instance_number"] if parent_task else None
@@ -641,9 +816,9 @@ def new_task_form(parent_task=None):
         st.session_state["new_task_due_date"] = st.session_state["new_task_start_date"]
         st.session_state["new_task_last_start_date"] = st.session_state["new_task_start_date"]
 
-    start_time = st.time_input("Start time", value=time(9, 0))
+    start_time = st.time_input("Start time", key="new_task_start_time")
     due_date = st.date_input("Due date", key="new_task_due_date")
-    due_time = st.time_input("Due time", value=time(17, 0))
+    due_time = st.time_input("Due time", key="new_task_due_time")
     selected_size = st.selectbox(
         "Task size",
         options=size_options,
@@ -802,6 +977,9 @@ def edit_task_form(task_row):
     friction_options = get_lookup_options("dim_task_frictions")
     parsed_start = parse_datetime_value(task_row["start_date"]) or datetime.now(pytz.UTC)
     parsed_due = parse_datetime_value(task_row["due_date"]) or parsed_start
+    today_utc = datetime.now(pytz.UTC).date()
+    initial_start_date = max(parsed_start.date(), today_utc)
+    initial_due_date = max(parsed_due.date(), initial_start_date)
     rrule_raw_value = task_row.get("rrule")
     rrule_components = parse_rrule_components(rrule_raw_value)
     is_recurrent = has_rrule_value(rrule_raw_value)
@@ -834,7 +1012,13 @@ def edit_task_form(task_row):
         except ValueError:
             recurrence_end_date = None
 
-    is_series_task = bool(task_row.get("rrule"))
+    initial_recurrence_end_date = (
+        max(recurrence_end_date, initial_start_date)
+        if recurrence_end_date
+        else None
+    )
+
+    is_series_task = has_rrule_value(task_row.get("rrule"))
     apply_scope = "Single task"
     if is_series_task:
         apply_scope = st.radio(
@@ -880,9 +1064,9 @@ def edit_task_form(task_row):
         selected_list_name = None
         st.info("This user does not have any available list yet.")
 
-    start_date = st.date_input("Start date", value=parsed_start.date())
+    start_date = st.date_input("Start date", value=initial_start_date, min_value=today_utc)
     start_time = st.time_input("Start time", value=parsed_start.time().replace(tzinfo=None))
-    due_date = st.date_input("Due date", value=parsed_due.date(), min_value=start_date)
+    due_date = st.date_input("Due date", value=initial_due_date, min_value=start_date)
     due_time = st.time_input("Due time", value=parsed_due.time().replace(tzinfo=None))
     selected_size = st.selectbox(
         "Task size",
@@ -943,7 +1127,7 @@ def edit_task_form(task_row):
         if has_end_date:
             recurrence_end_date = st.date_input(
                 "Recurrence end date",
-                value=recurrence_end_date or due_date,
+                value=initial_recurrence_end_date or due_date,
                 min_value=start_date,
             )
         else:
@@ -1178,7 +1362,7 @@ def render_tasks_page():
         preferred_column_order = [
             "display_start_date",
             "display_due_date",
-            "title",
+            "display_title",
         ]
         show_routines = st.toggle("Show routines", value=False)
         filtered_tasks_df = tasks_df[
@@ -1202,32 +1386,50 @@ def render_tasks_page():
             else preferred_column_order
         )
 
-        st.dataframe(
-            filtered_tasks_df[visible_columns],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "title": "Title",
-                "display_due_date": "Due date",
-                "display_start_date": "Start date",
-                "status": "Status",
-                "WOBJ": "WOBJ",
-                "WSUB": "WSUB",
-                "Urgency": "Urgency",
-            },
+        grid_df = filtered_tasks_df.copy()
+        grid_builder = GridOptionsBuilder.from_dataframe(grid_df)
+        grid_builder.configure_selection(
+            selection_mode="single",
+            use_checkbox=False,
+            suppressRowDeselection=False,
+        )
+        for column_name in grid_df.columns:
+            grid_builder.configure_column(
+                column_name,
+                hide=column_name not in visible_columns,
+            )
+
+        grid_builder.configure_column(
+            "display_title",
+            header_name="Title",
+            cellStyle={"fontWeight": "bold"},
+        )
+        grid_builder.configure_column("display_due_date", header_name="Due date")
+        grid_builder.configure_column("display_start_date", header_name="Start date")
+        grid_builder.configure_column("status", header_name="Status")
+        grid_builder.configure_column("WOBJ", header_name="WOBJ")
+        grid_builder.configure_column("WSUB", header_name="WSUB")
+        grid_builder.configure_column("Urgency", header_name="Urgency")
+        grid_builder.configure_grid_options(domLayout="normal")
+
+        grid_response = AgGrid(
+            grid_df,
+            gridOptions=grid_builder.build(),
+            height=280,
+            fit_columns_on_grid_load=True,
+            allow_unsafe_jscode=False,
+            theme="streamlit",
+            update_on=["selectionChanged"],
+            key=f"tasks_grid_{show_routines}_{show_all_columns}",
+            defaultColDef= {
+                "cellStyle": {"fontSize": "16px"}
+            }
         )
 
-        selected_label = st.selectbox(
-            "Select a task",
-            options=filtered_tasks_df["selection_label"].tolist(),
-            index=None,
-            placeholder="Choose a task to manage",
-        )
+        selected_row = get_aggrid_selected_row(grid_response)
 
-        if selected_label:
-            selected_row = filtered_tasks_df.loc[
-                filtered_tasks_df["selection_label"] == selected_label
-            ].iloc[0].to_dict()
+        if selected_row:
+            st.caption(f"Selected task: {selected_row['title']}")
 
             action_col1, action_col2, action_col3, action_col4 = st.columns(4)
             with action_col1:
@@ -1471,6 +1673,7 @@ def registration_form():
                 user_id = auth_res.user.id
                 
                 if user_id:
+                    save_auth_cookie(auth_res)
                     # GUARDAR EN SESSION STATE PARA CONSUMO EN TODAS LAS PAGINAS Y FORMULARIOS DE LA APLICACION
                     st.session_state["user_id"] = user_id
                     
@@ -1522,6 +1725,7 @@ def login_form():
                 })
                 
                 # Guardar el ID en el session_state
+                save_auth_cookie(res)
                 st.session_state["user_id"] = res.user.id
                 refresh_user_profile_cache()
                 st.session_state["session_expected_work_time"] = None
@@ -1531,11 +1735,12 @@ def login_form():
                 st.rerun()  # Recargamos para actualizar la interfaz
                 
             except Exception as e:
-                st.error("Email o contraseña incorrectos")
+                handle_api_exception(e, f"Login failed: {e}")
 
 # --- LÓGICA DE CIERRE DE SESIÓN ---
 def logout():
     supabase.auth.sign_out()
+    clear_auth_cookie()
     st.session_state["user_id"] = None
     st.session_state.pop("user_profile", None)
     st.session_state["session_expected_work_time"] = None
@@ -1547,6 +1752,8 @@ def logout():
 # Verificamos si hay sesión activa al cargar
 if "user_id" not in st.session_state:
     st.session_state["user_id"] = None
+
+restore_auth_session_from_cookie()
 
 # --- FLUJO PRINCIPAL ---
 if st.session_state["user_id"]:
