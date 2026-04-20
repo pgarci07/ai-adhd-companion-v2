@@ -34,6 +34,6 @@ INSERT INTO personas (name, description, self_describing) VALUES
 INSERT INTO states (name, description, self_describing) VALUES
 ('Frozen', 'Pending', $$I want to start, but I feel physically stuck and my to-do list feels like a threat.$$),
 ('Distracted', 'Pending', $$I'm in motion, but I keep drifting into 'side-quests' and can't stay on the main track.$$),
-('Optimizer', 'Pending', $$The plan is working, I feel steady momentum, and I'm ready to check things off $$),
+('Engaged', 'Pending', $$The plan is working, I feel steady momentum, and I'm ready to check things off $$),
 ('Recovery', 'Pending', $$My brain is out of fuel; every notification feels heavy and I need a guilt-free break.$$);
 

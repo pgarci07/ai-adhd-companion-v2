@@ -1,6 +1,9 @@
 import sys
 import os
 import json
+import base64
+import logging
+from pathlib import Path
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
@@ -9,7 +12,18 @@ import pandas as pd
 from datetime import datetime, time, timedelta, date
 import pytz # Recomendado para manejo de zonas horarias
 from st_aggrid import AgGrid, GridOptionsBuilder
+from app.ui.state.timers import (
+    INACTIVITY_TIMER_KEY,
+    WORK_TIMER_KEY,
+    get_inactivity_timer,
+    get_work_timer,
+)
 from app.application.use_cases.personas_catalog import PERSONAS, supabase
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 try:
     from streamlit_cookies_manager import EncryptedCookieManager
@@ -21,7 +35,18 @@ LOOKUP_TABLES = (
     "dim_task_consequences",
     "dim_task_frictions",
 )
+INITIAL_SESSION_STATE_NAMES = {"Frozen", "Engaged"}
+USER_SELECTABLE_STATE_NAMES = {"Frozen", "Engaged", "Recovery"}
 AUTH_COOKIE_KEY = "supabase_auth_session"
+AUTH_SESSION_STATE_KEY = "supabase_auth_session_payload"
+AUTH_REFRESH_MARGIN_SECONDS = 60
+REGISTRATION_WELCOME_MESSAGE_KEY = "registration_welcome_message"
+WELCOME_PROMPT_PATH = Path(__file__).resolve().parents[1] / "application" / "prompts" / "welcome_message.txt"
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_LOG_PATH = Path(__file__).resolve().parents[2] / "logs" / "openai.log"
+INACTIVITY_LOGOUT_SECONDS = 2 * 60
+WORK_TIMER_SECONDS = 20 * 60
+WORK_TIMER_EXPIRY_STATE_NAME = "Distracted"
 
 # Inicializo el user id en session state para evitar errores
 if "user_id" not in st.session_state:
@@ -103,6 +128,21 @@ def is_expired_jwt_error(error):
     return "JWT expired" in error_text or "PGRST303" in error_text
 
 
+def reset_auth_state():
+    clear_auth_cookie()
+    st.session_state["user_id"] = None
+    st.session_state.pop(AUTH_SESSION_STATE_KEY, None)
+    st.session_state.pop("user_profile", None)
+    st.session_state.pop("lookup_cache", None)
+    st.session_state.pop("states_cache", None)
+    st.session_state.pop(REGISTRATION_WELCOME_MESSAGE_KEY, None)
+    st.session_state.pop(INACTIVITY_TIMER_KEY, None)
+    st.session_state.pop(WORK_TIMER_KEY, None)
+    st.session_state["session_expected_work_time"] = None
+    st.session_state["show_welcome_dialog"] = False
+    st.session_state["current_page"] = "tasks"
+
+
 def clear_auth_cookie():
     if cookies is None:
         return
@@ -115,67 +155,175 @@ def clear_auth_cookie():
         pass
 
 
-def save_auth_cookie(auth_response):
-    if cookies is None:
-        return
-
-    session = getattr(auth_response, "session", None)
-    if not session:
-        return
+def decode_jwt_expiry(access_token):
+    if not access_token or not isinstance(access_token, str):
+        return None
 
     try:
-        cookies[AUTH_COOKIE_KEY] = json.dumps(
-            {
-                "access_token": getattr(session, "access_token", None),
-                "refresh_token": getattr(session, "refresh_token", None),
-            }
-        )
+        payload_segment = access_token.split(".")[1]
+        payload_segment += "=" * (-len(payload_segment) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_segment))
+        expires_at = payload.get("exp")
+        return int(expires_at) if expires_at is not None else None
+    except Exception:
+        return None
+
+
+def get_session_expires_at(session):
+    expires_at = getattr(session, "expires_at", None)
+    if expires_at is not None:
+        return int(expires_at)
+
+    expires_in = getattr(session, "expires_in", None)
+    if expires_in is not None:
+        return int(datetime.now(pytz.UTC).timestamp()) + int(expires_in)
+
+    return decode_jwt_expiry(getattr(session, "access_token", None))
+
+
+def get_auth_payload_from_response(auth_response):
+    session = getattr(auth_response, "session", None)
+    if not session:
+        return None
+
+    access_token = getattr(session, "access_token", None)
+    refresh_token = getattr(session, "refresh_token", None)
+    if not access_token or not refresh_token:
+        return None
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_at": get_session_expires_at(session),
+    }
+
+
+def save_auth_cookie(auth_response):
+    auth_payload = get_auth_payload_from_response(auth_response)
+    if not auth_payload:
+        return None
+
+    st.session_state[AUTH_SESSION_STATE_KEY] = auth_payload
+
+    if cookies is None:
+        return auth_payload
+
+    try:
+        cookies[AUTH_COOKIE_KEY] = json.dumps(auth_payload)
         cookies.save()
     except Exception:
         # A cookie failure should not block a valid login.
         pass
 
+    return auth_payload
 
-def restore_auth_session_from_cookie():
-    if cookies is None or st.session_state.get("user_id"):
-        return
 
-    raw_session = cookies.get(AUTH_COOKIE_KEY)
+def load_auth_cookie_payload():
+    session_payload = st.session_state.get(AUTH_SESSION_STATE_KEY)
+    if isinstance(session_payload, dict):
+        return session_payload
+
+    raw_session = cookies.get(AUTH_COOKIE_KEY) if cookies is not None else None
     if not raw_session:
-        return
+        return None
 
     if isinstance(raw_session, str):
         try:
             raw_session = json.loads(raw_session)
         except json.JSONDecodeError:
             clear_auth_cookie()
-            return
+            return None
 
     if not isinstance(raw_session, dict):
         clear_auth_cookie()
+        return None
+
+    st.session_state[AUTH_SESSION_STATE_KEY] = raw_session
+    return raw_session
+
+
+def should_refresh_access_token(expires_at):
+    if expires_at is None:
+        return True
+
+    try:
+        expires_at = int(expires_at)
+    except (TypeError, ValueError):
+        return True
+
+    now_timestamp = int(datetime.now(pytz.UTC).timestamp())
+    return expires_at <= now_timestamp + AUTH_REFRESH_MARGIN_SECONDS
+
+
+def refresh_auth_session(refresh_token):
+    if not refresh_token:
+        reset_auth_state()
+        return None
+
+    try:
+        auth_response = supabase.auth.refresh_session(refresh_token)
+    except Exception:
+        reset_auth_state()
+        return None
+
+    user = getattr(auth_response, "user", None)
+    session = getattr(auth_response, "session", None)
+    if not user or not session:
+        reset_auth_state()
+        return None
+
+    save_auth_cookie(auth_response)
+    st.session_state["user_id"] = user.id
+    return auth_response
+
+
+def restore_auth_session_from_cookie():
+    if cookies is None or st.session_state.get("user_id"):
+        return
+
+    raw_session = load_auth_cookie_payload()
+    if not raw_session:
         return
 
     access_token = raw_session.get("access_token")
     refresh_token = raw_session.get("refresh_token")
     if not access_token or not refresh_token:
-        clear_auth_cookie()
+        reset_auth_state()
+        return
+
+    expires_at = raw_session.get("expires_at") or decode_jwt_expiry(access_token)
+    if should_refresh_access_token(expires_at):
+        refresh_auth_session(refresh_token)
         return
 
     try:
         auth_response = supabase.auth.set_session(access_token, refresh_token)
     except Exception:
-        try:
-            auth_response = supabase.auth.refresh_session(refresh_token)
-        except Exception:
-            clear_auth_cookie()
-            return
+        refresh_auth_session(refresh_token)
+        return
 
     user = getattr(auth_response, "user", None)
     if not user:
-        clear_auth_cookie()
+        reset_auth_state()
         return
 
+    save_auth_cookie(auth_response)
     st.session_state["user_id"] = user.id
+
+
+def ensure_fresh_auth_session():
+    raw_session = load_auth_cookie_payload()
+    if not raw_session:
+        return not st.session_state.get("user_id")
+
+    refresh_token = raw_session.get("refresh_token")
+    access_token = raw_session.get("access_token")
+    expires_at = raw_session.get("expires_at") or decode_jwt_expiry(access_token)
+
+    if should_refresh_access_token(expires_at):
+        return refresh_auth_session(refresh_token) is not None
+
+    return True
 
 
 def handle_api_exception(error, fallback_message="Could not complete the request."):
@@ -185,18 +333,131 @@ def handle_api_exception(error, fallback_message="Could not complete the request
         except Exception:
             pass
 
-        clear_auth_cookie()
-        st.session_state["user_id"] = None
-        st.session_state.pop("user_profile", None)
-        st.session_state["session_expected_work_time"] = None
-        st.session_state["show_welcome_dialog"] = False
-        st.session_state["current_page"] = "tasks"
+        reset_auth_state()
         st.error("Your session expired. Please sign in again.")
         st.rerun()
         return True
 
     st.error(fallback_message)
     return False
+
+
+def expire_inactivity_session(timer=None):
+    st.warning("Session closed automatically after 15 minutes of inactivity.")
+    logout()
+
+
+def start_inactivity_logout_timer():
+    timer = get_inactivity_timer(st.session_state)
+    timer.start(
+        duration=INACTIVITY_LOGOUT_SECONDS,
+        on_expiry=expire_inactivity_session,
+    )
+
+
+def disable_inactivity_logout_timer():
+    get_inactivity_timer(st.session_state).disable()
+
+
+def tick_inactivity_logout_timer(*, user_interaction=False):
+    if not st.session_state.get("user_id"):
+        return
+
+    timer = get_inactivity_timer(st.session_state)
+    timer.configure(
+        duration=INACTIVITY_LOGOUT_SECONDS,
+        on_expiry=expire_inactivity_session,
+    )
+
+    timer.tick(user_interaction=user_interaction)
+
+
+def get_state_id_by_name(state_name):
+    response = (
+        supabase.table("states")
+        .select("id")
+        .eq("name", state_name)
+        .limit(1)
+        .execute()
+    )
+    rows = response.data or []
+    return rows[0]["id"] if rows else None
+
+
+def set_current_user_state_by_name(state_name):
+    state_id = get_state_id_by_name(state_name)
+    if state_id is None:
+        raise ValueError(f"State not found: {state_name}")
+
+    (
+        supabase.table("profiles")
+        .update({"state_id": state_id})
+        .eq("id", st.session_state["user_id"])
+        .execute()
+    )
+
+    if "user_profile" in st.session_state:
+        st.session_state["user_profile"] = {
+            **st.session_state["user_profile"],
+            "state_id": state_id,
+        }
+
+
+def expire_work_timer(timer=None):
+    if not st.session_state.get("user_id"):
+        return
+
+    try:
+        set_current_user_state_by_name(WORK_TIMER_EXPIRY_STATE_NAME)
+        st.warning("Work timer finished. Your state has been changed to Distracted.")
+        st.rerun()
+    except Exception as error:
+        handle_api_exception(error, f"Could not update state after work timer expiry: {error}")
+
+
+def start_work_timer():
+    timer = get_work_timer(st.session_state)
+    timer.start(
+        duration=WORK_TIMER_SECONDS,
+        on_expiry=expire_work_timer,
+    )
+
+
+def disable_work_timer():
+    get_work_timer(st.session_state).disable()
+
+
+def eoSprint(timer=None):
+    st.info("end of sprint")
+    disable_work_timer()
+
+
+def eoChunk(timer=None):
+    st.info("end of chunk")
+    disable_work_timer()
+
+
+def reset_work_timer_for_open_task(use_pomodoro_sprints):
+    user_preferences = get_user_preferences()
+    duration_minutes = (
+        int(user_preferences.get("sprint", 30))
+        if use_pomodoro_sprints
+        else 29
+    )
+    callback = eoSprint if use_pomodoro_sprints else eoChunk
+
+    get_work_timer(st.session_state).reset(
+        duration=duration_minutes * 60,
+        on_expiry=callback,
+    )
+
+
+def tick_work_timer():
+    if not st.session_state.get("user_id"):
+        return
+
+    timer = get_work_timer(st.session_state)
+    timer.tick()
 
 
 def get_user_lists():
@@ -263,7 +524,11 @@ def load_states_cache():
         .order("id")
         .execute()
     )
-    st.session_state["states_cache"] = response.data or []
+    st.session_state["states_cache"] = [
+        state
+        for state in response.data or []
+        if state.get("name") in USER_SELECTABLE_STATE_NAMES
+    ]
 
 
 def ensure_states_cache():
@@ -274,6 +539,14 @@ def ensure_states_cache():
 def get_states_options():
     ensure_states_cache()
     return st.session_state["states_cache"]
+
+
+def get_initial_session_state_options():
+    return [
+        state
+        for state in get_states_options()
+        if state.get("name") in INITIAL_SESSION_STATE_NAMES
+    ]
 
 
 def extract_first_name(full_name):
@@ -300,6 +573,168 @@ def calculate_age(born_value):
     if (today.month, today.day) < (born_date.month, born_date.day):
         age -= 1
     return age
+
+
+def get_openai_logger():
+    logger = logging.getLogger("ai_adhd.openai")
+    if logger.handlers:
+        return logger
+
+    OPENAI_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(OPENAI_LOG_PATH, encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    )
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    return logger
+
+
+def log_openai_event(level, message, **context):
+    safe_context = {}
+    for key, value in context.items():
+        if value is None:
+            safe_context[key] = None
+        elif key == "persona_description":
+            safe_context[key] = str(value)[:300]
+        else:
+            safe_context[key] = str(value)[:120]
+
+    get_openai_logger().log(
+        level,
+        "%s | context=%s",
+        message,
+        json.dumps(safe_context, ensure_ascii=False),
+    )
+
+
+def load_registration_welcome_prompt():
+    try:
+        return WELCOME_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        log_openai_event(
+            logging.ERROR,
+            "Could not read registration welcome prompt file.",
+            prompt_path=WELCOME_PROMPT_PATH,
+            error=repr(error),
+        )
+        return (
+            "Write a warm, concise Spanish welcome message for a newly registered "
+            "AI-ADHD user. Be encouraging and practical."
+        )
+
+
+def get_fallback_registration_welcome(first_name):
+    display_name = first_name or "there"
+    return (
+        f"Welcome, {display_name}. I am glad you are here: we will help you turn "
+        "your tasks into clearer, smaller, more manageable steps.\n\n"
+        "Before we begin, tell us how you are arriving to this session so we can "
+        "adapt the plan to your energy and the time you have available."
+    )
+
+
+def build_registration_welcome_prompt(first_name, age, persona_description):
+    prompt_template = load_registration_welcome_prompt()
+    age_text = str(age) if age is not None else "not provided"
+    return (
+        f"{prompt_template}\n\n"
+        "User context:\n"
+        f"- First name: {first_name or 'not provided'}\n"
+        f"- Age: {age_text}\n"
+        f"- Persona description: {persona_description or 'not provided'}"
+    )
+
+
+def extract_openai_text(response):
+    output_text = getattr(response, "output_text", None)
+    if output_text:
+        return output_text.strip()
+
+    try:
+        content = response.output[0].content[0]
+        text = getattr(content, "text", None)
+        return text.strip() if text else None
+    except Exception:
+        return None
+
+
+def generate_registration_welcome_message(first_name, age, persona_description):
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if OpenAI is None:
+        log_openai_event(
+            logging.ERROR,
+            "OpenAI package is not installed; using fallback welcome message.",
+            model=OPENAI_MODEL,
+            first_name=first_name,
+            age=age,
+            persona_description=persona_description,
+        )
+        return get_fallback_registration_welcome(first_name)
+
+    if not api_key:
+        log_openai_event(
+            logging.WARNING,
+            "OPENAI_API_KEY is not configured; using fallback welcome message.",
+            model=OPENAI_MODEL,
+            first_name=first_name,
+            age=age,
+            persona_description=persona_description,
+        )
+        return get_fallback_registration_welcome(first_name)
+
+    try:
+        log_openai_event(
+            logging.INFO,
+            "Requesting registration welcome message from OpenAI.",
+            model=OPENAI_MODEL,
+            first_name=first_name,
+            age=age,
+            persona_description=persona_description,
+        )
+        client = OpenAI(api_key=api_key)
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            input=build_registration_welcome_prompt(first_name, age, persona_description),
+            max_output_tokens=180,
+        )
+        welcome_message = extract_openai_text(response)
+        if not welcome_message:
+            log_openai_event(
+                logging.ERROR,
+                "OpenAI response did not contain extractable text; using fallback welcome message.",
+                model=OPENAI_MODEL,
+                first_name=first_name,
+                age=age,
+                response_type=type(response).__name__,
+            )
+            return get_fallback_registration_welcome(first_name)
+
+        log_openai_event(
+            logging.INFO,
+            "OpenAI registration welcome message generated successfully.",
+            model=OPENAI_MODEL,
+            first_name=first_name,
+            age=age,
+            message_length=len(welcome_message),
+        )
+        return welcome_message
+    except Exception as error:
+        get_openai_logger().exception(
+            "OpenAI welcome message generation failed; using fallback. context=%s",
+            json.dumps(
+                {
+                    "model": OPENAI_MODEL,
+                    "first_name": first_name,
+                    "age": age,
+                    "persona_description": str(persona_description or "")[:300],
+                    "error": repr(error),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        return get_fallback_registration_welcome(first_name)
 
 
 def load_user_profile_cache():
@@ -573,7 +1008,13 @@ def get_tasks_dataframe():
     dataframe["display_start_date"] = dataframe["start_date"].apply(format_task_datetime)
     dataframe["display_due_date"] = dataframe["due_date"].apply(format_task_datetime)
     task_title_map = dataframe.set_index("task_id")["title"].to_dict()
+    task_routine_map = dataframe.set_index("task_id")["is_routine"].to_dict()
     dataframe["parent_title"] = dataframe["parent_task_id"].map(task_title_map)
+    dataframe["parent_is_routine"] = dataframe["parent_task_id"].map(task_routine_map)
+    dataframe["is_routine"] = (
+        dataframe["is_routine"].fillna(False)
+        | dataframe["parent_is_routine"].fillna(False)
+    )
     dataframe["is_subtask"] = dataframe["parent_task_id"].notna()
     dataframe["task_type"] = dataframe["is_subtask"].apply(
         lambda is_subtask: "Subtask" if is_subtask else "Task"
@@ -685,6 +1126,28 @@ def get_option_index(options, selected_id):
 
 def has_rrule_value(rrule_value):
     return bool(parse_rrule_components(rrule_value))
+
+
+def validate_subtask_date_range(parent_task, start_at_value, due_at_value):
+    if not parent_task:
+        return True
+
+    parent_start = parse_datetime_value(parent_task.get("start_date"))
+    parent_due = parse_datetime_value(parent_task.get("due_date"))
+
+    if not parent_start or not parent_due:
+        st.error("Could not validate the subtask dates because the parent task date range is incomplete.")
+        return False
+
+    if start_at_value < parent_start or due_at_value > parent_due:
+        st.error(
+            "Subtask dates must be within the parent task range: "
+            f"{format_task_datetime(parent_task.get('start_date'))} to "
+            f"{format_task_datetime(parent_task.get('due_date'))}."
+        )
+        return False
+
+    return True
 
 
 def get_aggrid_selected_row(grid_response):
@@ -911,6 +1374,9 @@ def new_task_form(parent_task=None):
             due_at_value = combine_date_and_time_value(due_date, due_time)
             if due_at_value < start_at_value:
                 st.error("Due date must be later than or equal to start date.")
+                return
+
+            if not validate_subtask_date_range(parent_task, start_at_value, due_at_value):
                 return
 
             if is_recurrent and recurrence_frequency == "WEEKLY" and not selected_weekdays:
@@ -1342,6 +1808,40 @@ def update_task_status(task_row, new_status):
         {"status": new_status}
     ).eq("id", task_row["instance_id"]).execute()
 
+
+@st.dialog("Open task")
+def open_task_dialog(task_row):
+    st.write(f"Open task: **{task_row['title']}**")
+
+    pomodoro_choice = st.selectbox(
+        "Use Pomodoro sprints?",
+        options=["Yes", "No"],
+        index=None,
+        placeholder="Choose yes or no",
+    )
+    body_doubling_choice = st.selectbox(
+        "Use Body-Doubling?",
+        options=["Yes", "No"],
+        index=None,
+        placeholder="Choose yes or no",
+    )
+
+    if st.button("OK", type="primary", use_container_width=True):
+        if pomodoro_choice is None or body_doubling_choice is None:
+            st.error("Please answer both questions before opening the task.")
+            return
+
+        try:
+            use_pomodoro_sprints = pomodoro_choice == "Yes"
+            st.session_state["use_body_doubling"] = body_doubling_choice == "Yes"
+            update_task_status(task_row, "open")
+            reset_work_timer_for_open_task(use_pomodoro_sprints)
+            st.success("Task opened.")
+            st.rerun()
+        except Exception as e:
+            handle_api_exception(e, f"Could not open task: {e}")
+
+
 def render_tasks_page():
     st.title("My Tasks")
     top_left, top_right = st.columns([3, 1])
@@ -1431,21 +1931,28 @@ def render_tasks_page():
         if selected_row:
             st.caption(f"Selected task: {selected_row['title']}")
 
-            action_col1, action_col2, action_col3, action_col4 = st.columns(4)
+            action_col1, action_col2, action_col3, action_col4, action_col5 = st.columns(5)
             with action_col1:
+                if st.button(
+                    "Open",
+                    use_container_width=True,
+                    disabled=selected_row["status"] in {"open", "completed", "archived"},
+                ):
+                    open_task_dialog(selected_row)
+            with action_col2:
                 if st.button(
                     "Edit task",
                     use_container_width=True,
                     disabled=selected_row["status"] in {"completed", "archived"},
                 ):
                     edit_task_form(selected_row)
-            with action_col2:
+            with action_col3:
                 if st.button("Delete task", use_container_width=True):
                     delete_task_dialog(selected_row)
-            with action_col3:
+            with action_col4:
                 if st.button("Create subtask", use_container_width=True):
                     new_task_form(parent_task=selected_row)
-            with action_col4:
+            with action_col5:
                  if st.button("Mark as done", use_container_width=True):
                     update_task_status(selected_row, "completed")
                     st.success("Task marked as completed.")
@@ -1539,7 +2046,7 @@ def render_preferences_page():
 @st.dialog("Bienvenido")
 def welcome_session_dialog():
     user_profile = ensure_user_profile_cache()
-    state_options = get_states_options()
+    state_options = get_initial_session_state_options()
     state_ids = [item["id"] for item in state_options]
     current_state_id = user_profile.get("state_id")
     state_index = None
@@ -1549,7 +2056,10 @@ def welcome_session_dialog():
         state_index = state_ids.index(current_state_id)
 
     with st.form("welcome_session_form"):
-        if first_name:
+        registration_welcome_message = st.session_state.get(REGISTRATION_WELCOME_MESSAGE_KEY)
+        if registration_welcome_message:
+            st.write(registration_welcome_message)
+        elif first_name:
             st.write(f"Welcome, {first_name}. Before we start, tell us how you're arriving to this session.")
         else:
             st.write("Welcome. Before we start, tell us how you're arriving to this session.")
@@ -1587,6 +2097,7 @@ def welcome_session_dialog():
                     "state_id": selected_state["id"],
                 }
                 st.session_state["show_welcome_dialog"] = False
+                st.session_state.pop(REGISTRATION_WELCOME_MESSAGE_KEY, None)
                 st.success("Sesión preparada.")
                 st.rerun()
             except Exception as e:
@@ -1673,7 +2184,14 @@ def registration_form():
                 user_id = auth_res.user.id
                 
                 if user_id:
-                    save_auth_cookie(auth_res)
+                    auth_payload = save_auth_cookie(auth_res)
+                    if not auth_payload:
+                        reset_auth_state()
+                        st.info(
+                            "Cuenta creada. Revisa tu email para confirmar la cuenta antes de iniciar sesión."
+                        )
+                        return
+
                     # GUARDAR EN SESSION STATE PARA CONSUMO EN TODAS LAS PAGINAS Y FORMULARIOS DE LA APLICACION
                     st.session_state["user_id"] = user_id
                     
@@ -1699,9 +2217,21 @@ def registration_form():
                     }).execute()
 
                     refresh_user_profile_cache()
+                    first_name = extract_first_name(full_name)
+                    age = calculate_age(born)
+                    persona_description = PERSONAS[persona_id]["description"]
+                    with st.spinner("Preparando tu bienvenida..."):
+                        st.session_state[REGISTRATION_WELCOME_MESSAGE_KEY] = (
+                            generate_registration_welcome_message(
+                                first_name=first_name,
+                                age=age,
+                                persona_description=persona_description,
+                            )
+                        )
                     st.session_state["session_expected_work_time"] = None
                     st.session_state["show_welcome_dialog"] = True
                     st.session_state["current_page"] = "tasks"
+                    start_inactivity_logout_timer()
                     
                     st.success("Registro completado y ID guardado en sesión. Mira en tu buzón para completar el registro.")
                     st.rerun()
@@ -1725,12 +2255,19 @@ def login_form():
                 })
                 
                 # Guardar el ID en el session_state
-                save_auth_cookie(res)
+                auth_payload = save_auth_cookie(res)
+                if not auth_payload:
+                    reset_auth_state()
+                    st.error("Login failed: Supabase did not return an active session.")
+                    return
+
                 st.session_state["user_id"] = res.user.id
                 refresh_user_profile_cache()
                 st.session_state["session_expected_work_time"] = None
                 st.session_state["show_welcome_dialog"] = True
                 st.session_state["current_page"] = "tasks"
+                start_inactivity_logout_timer()
+                start_work_timer()
                 st.success("¡Bienvenido de nuevo!")
                 st.rerun()  # Recargamos para actualizar la interfaz
                 
@@ -1739,14 +2276,24 @@ def login_form():
 
 # --- LÓGICA DE CIERRE DE SESIÓN ---
 def logout():
-    supabase.auth.sign_out()
-    clear_auth_cookie()
-    st.session_state["user_id"] = None
-    st.session_state.pop("user_profile", None)
-    st.session_state["session_expected_work_time"] = None
-    st.session_state["show_welcome_dialog"] = False
-    st.session_state["current_page"] = "tasks"
+    try:
+        supabase.auth.sign_out()
+    except Exception:
+        pass
+
+    reset_auth_state()
     st.rerun()
+
+
+if hasattr(st, "fragment"):
+    @st.fragment(run_every="5s")
+    def render_inactivity_logout_watcher():
+        tick_inactivity_logout_timer(user_interaction=False)
+        tick_work_timer()
+else:
+    def render_inactivity_logout_watcher():
+        tick_inactivity_logout_timer(user_interaction=False)
+        tick_work_timer()
 
 
 # Verificamos si hay sesión activa al cargar
@@ -1754,11 +2301,15 @@ if "user_id" not in st.session_state:
     st.session_state["user_id"] = None
 
 restore_auth_session_from_cookie()
+if st.session_state.get("user_id"):
+    ensure_fresh_auth_session()
+    tick_inactivity_logout_timer(user_interaction=True)
 
 # --- FLUJO PRINCIPAL ---
 if st.session_state["user_id"]:
     # ESTO ES LO QUE VE EL USUARIO LOGUEADO
     try:
+        render_inactivity_logout_watcher()
         render_sidebar()
 
         if should_prompt_welcome_dialog():
