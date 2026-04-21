@@ -1,6 +1,17 @@
 from datetime import timedelta
 
+import pytest
+
+from app.ui.state import timers
 from app.ui.state.timers import get_inactivity_timer, get_work_timer
+
+
+@pytest.fixture(autouse=True)
+def disable_timer_logging():
+    original_value = timers.ENABLE_TIMER_LOGGING
+    timers.ENABLE_TIMER_LOGGING = False
+    yield
+    timers.ENABLE_TIMER_LOGGING = original_value
 
 
 class FakeClock:

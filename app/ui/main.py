@@ -41,10 +41,19 @@ AUTH_COOKIE_KEY = "supabase_auth_session"
 AUTH_SESSION_STATE_KEY = "supabase_auth_session_payload"
 AUTH_REFRESH_MARGIN_SECONDS = 60
 REGISTRATION_WELCOME_MESSAGE_KEY = "registration_welcome_message"
+OPEN_TASK_GUIDANCE_MESSAGE_KEY = "open_task_guidance_message"
+OPEN_TASK_GUIDANCE_EXPIRES_AT_KEY = "open_task_guidance_expires_at"
+OPEN_TASK_DIALOG_TASK_KEY = "open_task_dialog_task"
+OPEN_TASK_PENDING_CONTEXT_KEY = "open_task_pending_context"
+OPEN_TASK_GUIDANCE_MODAL_SECONDS = 15
+SPRINT_REVIEW_PENDING_KEY = "sprint_review_pending"
+REST_MESSAGE_KEY = "rest_message"
+REST_MESSAGE_EXPIRES_AT_KEY = "rest_message_expires_at"
+REST_MESSAGE_MODAL_SECONDS = 15
 WELCOME_PROMPT_PATH = Path(__file__).resolve().parents[1] / "application" / "prompts" / "welcome_message.txt"
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_LOG_PATH = Path(__file__).resolve().parents[2] / "logs" / "openai.log"
-INACTIVITY_LOGOUT_SECONDS = 2 * 60
+INACTIVITY_LOGOUT_SECONDS = 30 * 60
 WORK_TIMER_SECONDS = 20 * 60
 WORK_TIMER_EXPIRY_STATE_NAME = "Distracted"
 
@@ -57,6 +66,8 @@ if "session_expected_work_time" not in st.session_state:
     st.session_state["session_expected_work_time"] = None
 if "current_page" not in st.session_state:
     st.session_state["current_page"] = "tasks"
+if "tasks_grid_version" not in st.session_state:
+    st.session_state["tasks_grid_version"] = 0
 
 # --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(page_title="AI-ADHD", layout="wide")
@@ -136,11 +147,19 @@ def reset_auth_state():
     st.session_state.pop("lookup_cache", None)
     st.session_state.pop("states_cache", None)
     st.session_state.pop(REGISTRATION_WELCOME_MESSAGE_KEY, None)
+    st.session_state.pop(OPEN_TASK_GUIDANCE_MESSAGE_KEY, None)
+    st.session_state.pop(OPEN_TASK_GUIDANCE_EXPIRES_AT_KEY, None)
+    st.session_state.pop(OPEN_TASK_DIALOG_TASK_KEY, None)
+    st.session_state.pop(OPEN_TASK_PENDING_CONTEXT_KEY, None)
+    st.session_state.pop(SPRINT_REVIEW_PENDING_KEY, None)
+    st.session_state.pop(REST_MESSAGE_KEY, None)
+    st.session_state.pop(REST_MESSAGE_EXPIRES_AT_KEY, None)
     st.session_state.pop(INACTIVITY_TIMER_KEY, None)
     st.session_state.pop(WORK_TIMER_KEY, None)
     st.session_state["session_expected_work_time"] = None
     st.session_state["show_welcome_dialog"] = False
     st.session_state["current_page"] = "tasks"
+    st.session_state["tasks_grid_version"] = 0
 
 
 def clear_auth_cookie():
@@ -427,14 +446,43 @@ def disable_work_timer():
     get_work_timer(st.session_state).disable()
 
 
+def set_rest_message(message):
+    st.session_state[REST_MESSAGE_KEY] = message
+    st.session_state[REST_MESSAGE_EXPIRES_AT_KEY] = (
+        datetime.now(pytz.UTC).timestamp() + REST_MESSAGE_MODAL_SECONDS
+    )
+
+
+def clear_rest_message():
+    st.session_state.pop(REST_MESSAGE_KEY, None)
+    st.session_state.pop(REST_MESSAGE_EXPIRES_AT_KEY, None)
+
+
+def clear_expired_rest_message():
+    expires_at = st.session_state.get(REST_MESSAGE_EXPIRES_AT_KEY)
+    if expires_at is None:
+        return
+
+    if datetime.now(pytz.UTC).timestamp() >= float(expires_at):
+        clear_rest_message()
+        st.rerun()
+
+
 def eoSprint(timer=None):
-    st.info("end of sprint")
+    st.session_state[SPRINT_REVIEW_PENDING_KEY] = True
     disable_work_timer()
+    st.rerun()
 
 
 def eoChunk(timer=None):
     st.info("end of chunk")
     disable_work_timer()
+
+
+def eoRest(timer=None):
+    set_rest_message("Rest is over.")
+    disable_work_timer()
+    st.rerun()
 
 
 def reset_work_timer_for_open_task(use_pomodoro_sprints):
@@ -450,6 +498,28 @@ def reset_work_timer_for_open_task(use_pomodoro_sprints):
         duration=duration_minutes * 60,
         on_expiry=callback,
     )
+
+
+def set_open_task_guidance_message(message):
+    st.session_state[OPEN_TASK_GUIDANCE_MESSAGE_KEY] = message
+    st.session_state[OPEN_TASK_GUIDANCE_EXPIRES_AT_KEY] = (
+        datetime.now(pytz.UTC).timestamp() + OPEN_TASK_GUIDANCE_MODAL_SECONDS
+    )
+
+
+def clear_open_task_guidance_message():
+    st.session_state.pop(OPEN_TASK_GUIDANCE_MESSAGE_KEY, None)
+    st.session_state.pop(OPEN_TASK_GUIDANCE_EXPIRES_AT_KEY, None)
+
+
+def clear_expired_open_task_guidance_message():
+    expires_at = st.session_state.get(OPEN_TASK_GUIDANCE_EXPIRES_AT_KEY)
+    if expires_at is None:
+        return
+
+    if datetime.now(pytz.UTC).timestamp() >= float(expires_at):
+        clear_open_task_guidance_message()
+        st.rerun()
 
 
 def tick_work_timer():
@@ -737,6 +807,148 @@ def generate_registration_welcome_message(first_name, age, persona_description):
         return get_fallback_registration_welcome(first_name)
 
 
+def get_fallback_open_task_guidance(task_title, use_pomodoro_sprints, use_body_doubling):
+    timing_text = (
+        "Work with the sprint timer: focus on just the next small step until it rings."
+        if use_pomodoro_sprints
+        else "Use this work chunk to make steady progress without worrying about finishing everything."
+    )
+    body_doubling_text = (
+        "If body-doubling helps, keep someone nearby or visible and let their presence anchor you."
+        if use_body_doubling
+        else "You can do this solo: keep the task visible and remove one distraction before starting."
+    )
+    return (
+        f"Task opened: {task_title}.\n\n"
+        f"{timing_text} {body_doubling_text}"
+    )
+
+
+def build_open_task_guidance_prompt(
+    task_title,
+    task_description,
+    use_pomodoro_sprints,
+    use_body_doubling,
+    duration_minutes,
+):
+    return (
+        "You are the supportive task-start voice of AI-ADHD.\n"
+        "Write a concise British English message for a user who has just opened a task.\n"
+        "Use a practical, warm, non-judgemental tone. Do not mention that you are an AI model.\n"
+        "Keep it to 2 short paragraphs and focus on starting now.\n\n"
+        "Task context:\n"
+        f"- Title: {task_title or 'Untitled'}\n"
+        f"- Description: {task_description or 'No description provided'}\n"
+        f"- Uses Pomodoro sprint: {'yes' if use_pomodoro_sprints else 'no'}\n"
+        f"- Uses Body-Doubling: {'yes' if use_body_doubling else 'no'}\n"
+        f"- Timer duration in minutes: {duration_minutes}"
+    )
+
+
+def generate_open_task_guidance_message(
+    task_row,
+    use_pomodoro_sprints,
+    use_body_doubling,
+    duration_minutes,
+):
+    task_title = task_row.get("title", "Untitled")
+    api_key = os.environ.get("OPENAI_API_KEY")
+
+    if OpenAI is None:
+        log_openai_event(
+            logging.ERROR,
+            "OpenAI package is not installed; using fallback open-task guidance.",
+            model=OPENAI_MODEL,
+            task_title=task_title,
+            use_pomodoro_sprints=use_pomodoro_sprints,
+            use_body_doubling=use_body_doubling,
+        )
+        return get_fallback_open_task_guidance(
+            task_title,
+            use_pomodoro_sprints,
+            use_body_doubling,
+        )
+
+    if not api_key:
+        log_openai_event(
+            logging.WARNING,
+            "OPENAI_API_KEY is not configured; using fallback open-task guidance.",
+            model=OPENAI_MODEL,
+            task_title=task_title,
+            use_pomodoro_sprints=use_pomodoro_sprints,
+            use_body_doubling=use_body_doubling,
+        )
+        return get_fallback_open_task_guidance(
+            task_title,
+            use_pomodoro_sprints,
+            use_body_doubling,
+        )
+
+    try:
+        log_openai_event(
+            logging.INFO,
+            "Requesting open-task guidance from OpenAI.",
+            model=OPENAI_MODEL,
+            task_title=task_title,
+            use_pomodoro_sprints=use_pomodoro_sprints,
+            use_body_doubling=use_body_doubling,
+        )
+        client = OpenAI(api_key=api_key)
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            input=build_open_task_guidance_prompt(
+                task_title=task_title,
+                task_description=task_row.get("description"),
+                use_pomodoro_sprints=use_pomodoro_sprints,
+                use_body_doubling=use_body_doubling,
+                duration_minutes=duration_minutes,
+            ),
+            max_output_tokens=180,
+        )
+        guidance_message = extract_openai_text(response)
+        if not guidance_message:
+            log_openai_event(
+                logging.ERROR,
+                "OpenAI response did not contain extractable text; using fallback open-task guidance.",
+                model=OPENAI_MODEL,
+                task_title=task_title,
+                response_type=type(response).__name__,
+            )
+            return get_fallback_open_task_guidance(
+                task_title,
+                use_pomodoro_sprints,
+                use_body_doubling,
+            )
+
+        log_openai_event(
+            logging.INFO,
+            "OpenAI open-task guidance generated successfully.",
+            model=OPENAI_MODEL,
+            task_title=task_title,
+            message_length=len(guidance_message),
+        )
+        return guidance_message
+    except Exception as error:
+        get_openai_logger().exception(
+            "OpenAI open-task guidance generation failed; using fallback. context=%s",
+            json.dumps(
+                {
+                    "model": OPENAI_MODEL,
+                    "task_title": task_title,
+                    "use_pomodoro_sprints": use_pomodoro_sprints,
+                    "use_body_doubling": use_body_doubling,
+                    "error": repr(error),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        return get_fallback_open_task_guidance(
+            task_title,
+            use_pomodoro_sprints,
+            use_body_doubling,
+        )
+
+
 def load_user_profile_cache():
     default_profile = {
         "full_name": None,
@@ -1016,6 +1228,8 @@ def get_tasks_dataframe():
         | dataframe["parent_is_routine"].fillna(False)
     )
     dataframe["is_subtask"] = dataframe["parent_task_id"].notna()
+    parent_task_ids = set(dataframe["parent_task_id"].dropna())
+    dataframe["has_subtasks"] = dataframe["task_id"].isin(parent_task_ids)
     dataframe["task_type"] = dataframe["is_subtask"].apply(
         lambda is_subtask: "Subtask" if is_subtask else "Task"
     )
@@ -1148,6 +1362,29 @@ def validate_subtask_date_range(parent_task, start_at_value, due_at_value):
         return False
 
     return True
+
+
+def get_task_row_by_instance_id(instance_id):
+    rows = get_task_rows()
+    for row in rows:
+        if row.get("instance_id") == instance_id:
+            return row
+    return None
+
+
+def refresh_parent_task_for_subtask(parent_task):
+    if not parent_task:
+        return None
+
+    fresh_parent_task = get_task_row_by_instance_id(parent_task["instance_id"])
+    if fresh_parent_task is None:
+        st.error("Could not refresh the parent task before creating the subtask.")
+        return None
+
+    return {
+        **parent_task,
+        **fresh_parent_task,
+    }
 
 
 def get_aggrid_selected_row(grid_response):
@@ -1353,6 +1590,10 @@ def new_task_form(parent_task=None):
 
     if st.button("Create task", type="primary", use_container_width=True):
         try:
+            current_parent_task = refresh_parent_task_for_subtask(parent_task)
+            if parent_task and current_parent_task is None:
+                return
+
             list_id = list_options.get(selected_list_name)
             if not list_id:
                 st.error("No list is available for this user yet.")
@@ -1376,7 +1617,7 @@ def new_task_form(parent_task=None):
                 st.error("Due date must be later than or equal to start date.")
                 return
 
-            if not validate_subtask_date_range(parent_task, start_at_value, due_at_value):
+            if not validate_subtask_date_range(current_parent_task, start_at_value, due_at_value):
                 return
 
             if is_recurrent and recurrence_frequency == "WEEKLY" and not selected_weekdays:
@@ -1685,6 +1926,7 @@ def edit_task_form(task_row):
                     )
 
             st.success("Task updated successfully.")
+            st.session_state["tasks_grid_version"] += 1
             st.rerun()
         except Exception as e:
             st.error(f"Error updating task: {e}")
@@ -1807,10 +2049,98 @@ def update_task_status(task_row, new_status):
     supabase.table("task_instances").update(
         {"status": new_status}
     ).eq("id", task_row["instance_id"]).execute()
+    st.session_state["tasks_grid_version"] += 1
+
+
+def get_open_task_row(exclude_instance_id=None):
+    for row in get_task_rows():
+        if row.get("status") != "open":
+            continue
+        if exclude_instance_id and row.get("instance_id") == exclude_instance_id:
+            continue
+        return row
+    return None
+
+
+def clear_open_task_dialog_state():
+    st.session_state.pop(OPEN_TASK_DIALOG_TASK_KEY, None)
+    st.session_state.pop(OPEN_TASK_PENDING_CONTEXT_KEY, None)
+
+
+def build_open_task_context(task_row, pomodoro_choice, body_doubling_choice):
+    use_pomodoro_sprints = pomodoro_choice == "Yes"
+    use_body_doubling = body_doubling_choice == "Yes"
+    duration_minutes = (
+        int(get_user_preferences().get("sprint", 30))
+        if use_pomodoro_sprints
+        else 29
+    )
+    return {
+        "task_row": task_row,
+        "use_pomodoro_sprints": use_pomodoro_sprints,
+        "use_body_doubling": use_body_doubling,
+        "duration_minutes": duration_minutes,
+    }
+
+
+def complete_open_task_flow(context):
+    task_row = context["task_row"]
+    use_pomodoro_sprints = context["use_pomodoro_sprints"]
+    use_body_doubling = context["use_body_doubling"]
+    duration_minutes = context["duration_minutes"]
+
+    st.session_state["use_body_doubling"] = use_body_doubling
+    update_task_status(task_row, "open")
+    reset_work_timer_for_open_task(use_pomodoro_sprints)
+    with st.spinner("Preparing task support..."):
+        set_open_task_guidance_message(
+            generate_open_task_guidance_message(
+                task_row=task_row,
+                use_pomodoro_sprints=use_pomodoro_sprints,
+                use_body_doubling=use_body_doubling,
+                duration_minutes=duration_minutes,
+            )
+        )
+    clear_open_task_dialog_state()
+    st.success("Task opened.")
+    st.rerun()
+
+
+def render_existing_open_task_resolution(context):
+    existing_open_task = context["existing_open_task"]
+    st.warning(
+        "You already have an open task: "
+        f"**{existing_open_task['title']}**"
+    )
+    st.write(f"Did you complete {existing_open_task['title']}?")
+
+    completed_column, asleep_column, cancel_column = st.columns(3)
+    try:
+        with completed_column:
+            if st.button("Yes, completed", type="primary", use_container_width=True):
+                update_task_status(existing_open_task, "completed")
+                complete_open_task_flow(context)
+
+        with asleep_column:
+            if st.button("No, send to sleep", use_container_width=True):
+                update_task_status(existing_open_task, "asleep")
+                complete_open_task_flow(context)
+
+        with cancel_column:
+            if st.button("Cancel", use_container_width=True):
+                clear_open_task_dialog_state()
+                st.rerun()
+    except Exception as e:
+        handle_api_exception(e, f"Could not resolve the previously open task: {e}")
 
 
 @st.dialog("Open task")
 def open_task_dialog(task_row):
+    pending_context = st.session_state.get(OPEN_TASK_PENDING_CONTEXT_KEY)
+    if pending_context:
+        render_existing_open_task_resolution(pending_context)
+        return
+
     st.write(f"Open task: **{task_row['title']}**")
 
     pomodoro_choice = st.selectbox(
@@ -1832,14 +2162,120 @@ def open_task_dialog(task_row):
             return
 
         try:
-            use_pomodoro_sprints = pomodoro_choice == "Yes"
-            st.session_state["use_body_doubling"] = body_doubling_choice == "Yes"
-            update_task_status(task_row, "open")
-            reset_work_timer_for_open_task(use_pomodoro_sprints)
-            st.success("Task opened.")
-            st.rerun()
+            context = build_open_task_context(
+                task_row,
+                pomodoro_choice,
+                body_doubling_choice,
+            )
+            existing_open_task = get_open_task_row(
+                exclude_instance_id=task_row["instance_id"]
+            )
+            if existing_open_task:
+                context["existing_open_task"] = existing_open_task
+                st.session_state[OPEN_TASK_PENDING_CONTEXT_KEY] = context
+                render_existing_open_task_resolution(context)
+                return
+
+            complete_open_task_flow(context)
         except Exception as e:
             handle_api_exception(e, f"Could not open task: {e}")
+
+    if st.button("Cancel", use_container_width=True):
+        clear_open_task_dialog_state()
+        st.rerun()
+
+
+@st.dialog("Task support")
+def open_task_guidance_dialog():
+    message = st.session_state.get(OPEN_TASK_GUIDANCE_MESSAGE_KEY)
+    if not message:
+        return
+
+    st.write(message)
+    st.caption("This message will close automatically in 15 seconds.")
+
+
+def render_open_task_guidance_dialog():
+    expires_at = st.session_state.get(OPEN_TASK_GUIDANCE_EXPIRES_AT_KEY)
+    if expires_at is None:
+        return
+
+    if datetime.now(pytz.UTC).timestamp() >= float(expires_at):
+        clear_open_task_guidance_message()
+        return
+
+    open_task_guidance_dialog()
+
+
+@st.dialog("Sprint review")
+def sprint_review_dialog():
+    st.write("sprint is over")
+
+    completed_choice = st.selectbox(
+        "Did you complete the task?",
+        options=["Yes", "No"],
+        index=None,
+        placeholder="Choose yes or no",
+    )
+    rest_choice = st.selectbox(
+        "Do you want to continue and move to rest?",
+        options=["Yes", "No"],
+        index=None,
+        placeholder="Choose yes or no",
+    )
+
+    if st.button("OK", type="primary", use_container_width=True):
+        if completed_choice is None or rest_choice is None:
+            st.error("Please answer both questions before continuing.")
+            return
+
+        try:
+            open_task = get_open_task_row()
+            if completed_choice == "Yes":
+                if open_task:
+                    update_task_status(open_task, "completed")
+                else:
+                    st.warning("There is no open task to mark as completed.")
+
+            if rest_choice == "Yes":
+                get_work_timer(st.session_state).reset(
+                    duration=10 * 60,
+                    on_expiry=eoRest,
+                )
+            else:
+                disable_work_timer()
+
+            st.session_state.pop(SPRINT_REVIEW_PENDING_KEY, None)
+            st.rerun()
+        except Exception as e:
+            handle_api_exception(e, f"Could not finish sprint review: {e}")
+
+
+def render_sprint_review_dialog():
+    if st.session_state.get(SPRINT_REVIEW_PENDING_KEY):
+        sprint_review_dialog()
+
+
+@st.dialog("Rest")
+def rest_message_dialog():
+    message = st.session_state.get(REST_MESSAGE_KEY)
+    if not message:
+        return
+
+    st.write(message)
+    st.caption("This message will close automatically in 15 seconds.")
+
+
+def render_rest_message_dialog():
+    expires_at = st.session_state.get(REST_MESSAGE_EXPIRES_AT_KEY)
+    if expires_at is None:
+        return
+
+    if datetime.now(pytz.UTC).timestamp() >= float(expires_at):
+        clear_rest_message()
+        return
+
+    rest_message_dialog()
 
 
 def render_tasks_page():
@@ -1920,7 +2356,7 @@ def render_tasks_page():
             allow_unsafe_jscode=False,
             theme="streamlit",
             update_on=["selectionChanged"],
-            key=f"tasks_grid_{show_routines}_{show_all_columns}",
+            key=f"tasks_grid_{show_routines}_{show_all_columns}_{st.session_state['tasks_grid_version']}",
             defaultColDef= {
                 "cellStyle": {"fontSize": "16px"}
             }
@@ -1931,32 +2367,48 @@ def render_tasks_page():
         if selected_row:
             st.caption(f"Selected task: {selected_row['title']}")
 
-            action_col1, action_col2, action_col3, action_col4, action_col5 = st.columns(5)
-            with action_col1:
-                if st.button(
-                    "Open",
-                    use_container_width=True,
-                    disabled=selected_row["status"] in {"open", "completed", "archived"},
-                ):
-                    open_task_dialog(selected_row)
-            with action_col2:
+            is_parent_task = bool(selected_row.get("has_subtasks"))
+            action_columns = st.columns(4 if is_parent_task else 5)
+            next_action_column = 0
+
+            if not is_parent_task:
+                with action_columns[next_action_column]:
+                    if st.button(
+                        "Open",
+                        use_container_width=True,
+                        disabled=selected_row["status"] in {"completed", "archived"},
+                    ):
+                        st.session_state[OPEN_TASK_DIALOG_TASK_KEY] = selected_row
+                next_action_column += 1
+
+            with action_columns[next_action_column]:
                 if st.button(
                     "Edit task",
                     use_container_width=True,
                     disabled=selected_row["status"] in {"completed", "archived"},
                 ):
                     edit_task_form(selected_row)
-            with action_col3:
+            next_action_column += 1
+
+            with action_columns[next_action_column]:
                 if st.button("Delete task", use_container_width=True):
                     delete_task_dialog(selected_row)
-            with action_col4:
+            next_action_column += 1
+
+            with action_columns[next_action_column]:
                 if st.button("Create subtask", use_container_width=True):
                     new_task_form(parent_task=selected_row)
-            with action_col5:
+            next_action_column += 1
+
+            with action_columns[next_action_column]:
                  if st.button("Mark as done", use_container_width=True):
                     update_task_status(selected_row, "completed")
                     st.success("Task marked as completed.")
                     st.rerun()
+
+        open_dialog_task = st.session_state.get(OPEN_TASK_DIALOG_TASK_KEY)
+        if open_dialog_task:
+            open_task_dialog(open_dialog_task)
     except Exception as e:
         handle_api_exception(e, f"Could not load tasks: {e}")
 
@@ -2286,14 +2738,18 @@ def logout():
 
 
 if hasattr(st, "fragment"):
-    @st.fragment(run_every="5s")
+    @st.fragment(run_every="1s")
     def render_inactivity_logout_watcher():
         tick_inactivity_logout_timer(user_interaction=False)
         tick_work_timer()
+        clear_expired_open_task_guidance_message()
+        clear_expired_rest_message()
 else:
     def render_inactivity_logout_watcher():
         tick_inactivity_logout_timer(user_interaction=False)
         tick_work_timer()
+        clear_expired_open_task_guidance_message()
+        clear_expired_rest_message()
 
 
 # Verificamos si hay sesión activa al cargar
@@ -2307,9 +2763,15 @@ if st.session_state.get("user_id"):
 
 # --- FLUJO PRINCIPAL ---
 if st.session_state["user_id"]:
-    # ESTO ES LO QUE VE EL USUARIO LOGUEADO
+        # ESTO ES LO QUE VE EL USUARIO LOGUEADO
     try:
         render_inactivity_logout_watcher()
+        if st.session_state.get(SPRINT_REVIEW_PENDING_KEY):
+            render_sprint_review_dialog()
+        elif st.session_state.get(REST_MESSAGE_EXPIRES_AT_KEY) is not None:
+            render_rest_message_dialog()
+        else:
+            render_open_task_guidance_dialog()
         render_sidebar()
 
         if should_prompt_welcome_dialog():

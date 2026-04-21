@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, MutableMapping
 import logging
@@ -34,10 +34,15 @@ def log_timer_event(timer: "StreamlitTimer", event: str) -> None:
         return
 
     state = timer.state
+    now = timer._now()
+    expires_at = state["expires_at"]
+    pre_expires_at = state["pre_expires_at"]
+
     get_timer_logger().info(
         (
             "%s | timer=%s enabled=%s running=%s duration_seconds=%s "
-            "pre_expiry_seconds=%s expires_at=%s pre_expires_at=%s"
+            "pre_expiry_seconds=%s now=%s expires_at=%s expires_in_seconds=%s "
+            "pre_expires_at=%s pre_expires_in_seconds=%s"
         ),
         event,
         timer.name,
@@ -45,9 +50,26 @@ def log_timer_event(timer: "StreamlitTimer", event: str) -> None:
         state["running"],
         state["duration_seconds"],
         state["pre_expiry_seconds"],
-        state["expires_at"],
-        state["pre_expires_at"],
+        _format_timestamp(now),
+        _format_timestamp(expires_at),
+        _seconds_until(expires_at, now),
+        _format_timestamp(pre_expires_at),
+        _seconds_until(pre_expires_at, now),
     )
+
+
+def _format_timestamp(value: float | None) -> str | None:
+    if value is None:
+        return None
+
+    return datetime.fromtimestamp(value).astimezone().isoformat(timespec="seconds")
+
+
+def _seconds_until(value: float | None, now: float) -> float | None:
+    if value is None:
+        return None
+
+    return round(value - now, 3)
 
 
 def _normalise_seconds(value: float | int | timedelta | None) -> float | None:
