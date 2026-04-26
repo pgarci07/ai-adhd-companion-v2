@@ -15,18 +15,22 @@ ENABLE_TIMER_LOGGING = True
 TIMER_LOG_PATH = Path(__file__).resolve().parents[3] / "logs" / "timers.log"
 
 
-def get_timer_logger() -> logging.Logger:
-    logger = logging.getLogger("ai_adhd.timers")
-    if logger.handlers:
-        return logger
+def ensure_timer_log_file() -> None:
+    if not ENABLE_TIMER_LOGGING:
+        return
 
     TIMER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(TIMER_LOG_PATH, encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    return logger
+    TIMER_LOG_PATH.touch(exist_ok=True)
+
+
+def append_timer_log_line(message: str) -> None:
+    ensure_timer_log_file()
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    with TIMER_LOG_PATH.open("a", encoding="utf-8") as log_file:
+        log_file.write(f"{timestamp} INFO {message}\n")
+
+
+ensure_timer_log_file()
 
 
 def log_timer_event(timer: "StreamlitTimer", event: str) -> None:
@@ -38,23 +42,17 @@ def log_timer_event(timer: "StreamlitTimer", event: str) -> None:
     expires_at = state["expires_at"]
     pre_expires_at = state["pre_expires_at"]
 
-    get_timer_logger().info(
+    append_timer_log_line(
         (
-            "%s | timer=%s enabled=%s running=%s duration_seconds=%s "
-            "pre_expiry_seconds=%s now=%s expires_at=%s expires_in_seconds=%s "
-            "pre_expires_at=%s pre_expires_in_seconds=%s"
-        ),
-        event,
-        timer.name,
-        state["enabled"],
-        state["running"],
-        state["duration_seconds"],
-        state["pre_expiry_seconds"],
-        _format_timestamp(now),
-        _format_timestamp(expires_at),
-        _seconds_until(expires_at, now),
-        _format_timestamp(pre_expires_at),
-        _seconds_until(pre_expires_at, now),
+            f"{event} | timer={timer.name} enabled={state['enabled']} "
+            f"running={state['running']} duration_seconds={state['duration_seconds']} "
+            f"pre_expiry_seconds={state['pre_expiry_seconds']} "
+            f"now={_format_timestamp(now)} "
+            f"expires_at={_format_timestamp(expires_at)} "
+            f"expires_in_seconds={_seconds_until(expires_at, now)} "
+            f"pre_expires_at={_format_timestamp(pre_expires_at)} "
+            f"pre_expires_in_seconds={_seconds_until(pre_expires_at, now)}"
+        )
     )
 
 

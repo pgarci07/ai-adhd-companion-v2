@@ -37,6 +37,8 @@ LOOKUP_TABLES = (
 )
 INITIAL_SESSION_STATE_NAMES = {"Frozen", "Engaged"}
 USER_SELECTABLE_STATE_NAMES = {"Frozen", "Engaged", "Recovery"}
+GUIDED_TASK_PERSONA_NAME = "Overwhelmed Planner"
+GUIDED_TASK_STATE_NAME = "Frozen"
 AUTH_COOKIE_KEY = "supabase_auth_session"
 AUTH_SESSION_STATE_KEY = "supabase_auth_session_payload"
 AUTH_REFRESH_MARGIN_SECONDS = 60
@@ -53,7 +55,8 @@ REST_MESSAGE_MODAL_SECONDS = 15
 WELCOME_PROMPT_PATH = Path(__file__).resolve().parents[1] / "application" / "prompts" / "welcome_message.txt"
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_LOG_PATH = Path(__file__).resolve().parents[2] / "logs" / "openai.log"
-INACTIVITY_LOGOUT_SECONDS = 30 * 60
+TIMER_LOG_PATH = Path(__file__).resolve().parents[2] / "logs" / "timers.log"
+INACTIVITY_LOGOUT_SECONDS = 15 * 60
 WORK_TIMER_SECONDS = 20 * 60
 WORK_TIMER_EXPIRY_STATE_NAME = "Distracted"
 
@@ -146,6 +149,7 @@ def reset_auth_state():
     st.session_state.pop("user_profile", None)
     st.session_state.pop("lookup_cache", None)
     st.session_state.pop("states_cache", None)
+    st.session_state.pop("all_states_cache", None)
     st.session_state.pop(REGISTRATION_WELCOME_MESSAGE_KEY, None)
     st.session_state.pop(OPEN_TASK_GUIDANCE_MESSAGE_KEY, None)
     st.session_state.pop(OPEN_TASK_GUIDANCE_EXPIRES_AT_KEY, None)
@@ -367,6 +371,7 @@ def expire_inactivity_session(timer=None):
 
 
 def start_inactivity_logout_timer():
+    append_timer_log_line("request_start | timer=inactivity_timer source=start_inactivity_logout_timer")
     timer = get_inactivity_timer(st.session_state)
     timer.start(
         duration=INACTIVITY_LOGOUT_SECONDS,
@@ -375,6 +380,7 @@ def start_inactivity_logout_timer():
 
 
 def disable_inactivity_logout_timer():
+    append_timer_log_line("request_disable | timer=inactivity_timer source=disable_inactivity_logout_timer")
     get_inactivity_timer(st.session_state).disable()
 
 
@@ -435,6 +441,7 @@ def expire_work_timer(timer=None):
 
 
 def start_work_timer():
+    append_timer_log_line("request_start | timer=work_timer source=start_work_timer")
     timer = get_work_timer(st.session_state)
     timer.start(
         duration=WORK_TIMER_SECONDS,
@@ -443,6 +450,7 @@ def start_work_timer():
 
 
 def disable_work_timer():
+    append_timer_log_line("request_disable | timer=work_timer source=disable_work_timer")
     get_work_timer(st.session_state).disable()
 
 
@@ -493,6 +501,13 @@ def reset_work_timer_for_open_task(use_pomodoro_sprints):
         else 29
     )
     callback = eoSprint if use_pomodoro_sprints else eoChunk
+    append_timer_log_line(
+        (
+            "request_reset | timer=work_timer source=reset_work_timer_for_open_task "
+            f"use_pomodoro_sprints={use_pomodoro_sprints} "
+            f"duration_minutes={duration_minutes} callback={callback.__name__}"
+        )
+    )
 
     get_work_timer(st.session_state).reset(
         duration=duration_minutes * 60,
@@ -601,14 +616,34 @@ def load_states_cache():
     ]
 
 
+def load_all_states_cache():
+    response = (
+        supabase.table("states")
+        .select("id, name, self_describing")
+        .order("id")
+        .execute()
+    )
+    st.session_state["all_states_cache"] = response.data or []
+
+
 def ensure_states_cache():
     if "states_cache" not in st.session_state:
         load_states_cache()
 
 
+def ensure_all_states_cache():
+    if "all_states_cache" not in st.session_state:
+        load_all_states_cache()
+
+
 def get_states_options():
     ensure_states_cache()
     return st.session_state["states_cache"]
+
+
+def get_all_states_options():
+    ensure_all_states_cache()
+    return st.session_state["all_states_cache"]
 
 
 def get_initial_session_state_options():
@@ -677,6 +712,13 @@ def log_openai_event(level, message, **context):
         message,
         json.dumps(safe_context, ensure_ascii=False),
     )
+
+
+def append_timer_log_line(message):
+    TIMER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    with TIMER_LOG_PATH.open("a", encoding="utf-8") as log_file:
+        log_file.write(f"{timestamp} INFO {message}\n")
 
 
 def load_registration_welcome_prompt():
@@ -953,6 +995,7 @@ def load_user_profile_cache():
     default_profile = {
         "full_name": None,
         "first_name": None,
+        "persona_id": None,
         "role": "user",
         "born": None,
         "age": None,
@@ -971,7 +1014,7 @@ def load_user_profile_cache():
     try:
         response = (
             supabase.table("profiles")
-            .select("full_name, role, born, state_id, preferences")
+            .select("full_name, role, born, persona_id, state_id, preferences")
             .eq("id", user_id)
             .limit(1)
             .execute()
@@ -988,6 +1031,7 @@ def load_user_profile_cache():
     normalized_profile = {
         "full_name": profile.get("full_name"),
         "first_name": extract_first_name(profile.get("full_name")),
+        "persona_id": profile.get("persona_id"),
         "role": profile.get("role") or default_profile["role"],
         "born": profile.get("born"),
         "age": calculate_age(profile.get("born")),
@@ -1018,6 +1062,38 @@ def refresh_user_profile_cache():
 def get_user_preferences():
     profile = ensure_user_profile_cache()
     return profile["preferences"]
+
+
+def get_persona_name_by_id(persona_id):
+    if not persona_id:
+        return None
+
+    persona = PERSONAS.get(persona_id)
+    if persona:
+        return persona.get("name")
+
+    return None
+
+
+def get_state_name_by_id(state_id):
+    if not state_id:
+        return None
+
+    for state in get_all_states_options():
+        if state.get("id") == state_id:
+            return state.get("name")
+
+    return None
+
+
+def get_current_persona_name():
+    user_profile = ensure_user_profile_cache()
+    return get_persona_name_by_id(user_profile.get("persona_id"))
+
+
+def get_current_state_name():
+    user_profile = ensure_user_profile_cache()
+    return get_state_name_by_id(user_profile.get("state_id"))
 
 
 def get_effective_session_work_time():
@@ -1384,6 +1460,51 @@ def refresh_parent_task_for_subtask(parent_task):
     return {
         **parent_task,
         **fresh_parent_task,
+    }
+
+
+def get_guided_task_context(tasks_df):
+    persona_name = get_current_persona_name()
+    state_name = get_current_state_name()
+
+    if persona_name != GUIDED_TASK_PERSONA_NAME or state_name != GUIDED_TASK_STATE_NAME:
+        return None
+
+    if tasks_df.empty:
+        return None
+
+    candidate_df = tasks_df[
+        (~tasks_df["is_routine"])
+        & (~tasks_df["has_subtasks"])
+        & (tasks_df["status"].isin(["ready", "asleep", "open"]))
+    ].copy()
+
+    if candidate_df.empty:
+        return None
+
+    open_candidates = candidate_df[candidate_df["status"] == "open"]
+    if not open_candidates.empty:
+        chosen_task = open_candidates.sort_values(
+            by=["Urgency", "WSUB", "due_date"],
+            ascending=[False, True, True],
+        ).iloc[0]
+    else:
+        chosen_task = candidate_df.sort_values(
+            by=["WSUB", "Urgency", "due_date"],
+            ascending=[True, False, True],
+        ).iloc[0]
+
+    reason = (
+        "Guided mode is active for Overwhelmed Planner + Frozen. "
+        "The app is narrowing the choice to one concrete next task: "
+        "lowest start-up friction first, with urgency used as the tie-breaker."
+    )
+
+    return {
+        "persona_name": persona_name,
+        "state_name": state_name,
+        "task": chosen_task.to_dict(),
+        "reason": reason,
     }
 
 
@@ -2238,6 +2359,7 @@ def sprint_review_dialog():
                     st.warning("There is no open task to mark as completed.")
 
             if rest_choice == "Yes":
+                append_timer_log_line("request_reset | timer=work_timer source=sprint_review_rest duration_minutes=10 callback=eoRest")
                 get_work_timer(st.session_state).reset(
                     duration=10 * 60,
                     on_expiry=eoRest,
@@ -2278,19 +2400,68 @@ def render_rest_message_dialog():
     rest_message_dialog()
 
 
+def render_guided_task_actions(task_row):
+    st.caption(f"Guided task: {task_row['title']}")
+    open_column, asleep_column, complete_column = st.columns(3)
+
+    with open_column:
+        open_label = "Continue" if task_row["status"] == "open" else "Open"
+        if st.button(
+            open_label,
+            key=f"guided_open_{task_row['instance_id']}",
+            type="primary",
+            use_container_width=True,
+            disabled=task_row["status"] in {"completed", "archived"},
+        ):
+            st.session_state[OPEN_TASK_DIALOG_TASK_KEY] = task_row
+
+    with asleep_column:
+        if st.button(
+            "Not now",
+            key=f"guided_asleep_{task_row['instance_id']}",
+            use_container_width=True,
+            disabled=task_row["status"] in {"completed", "archived", "asleep"},
+        ):
+            update_task_status(task_row, "asleep")
+            st.success("Guided task moved to asleep.")
+            st.rerun()
+
+    with complete_column:
+        if st.button(
+            "Mark as done",
+            key=f"guided_done_{task_row['instance_id']}",
+            use_container_width=True,
+            disabled=task_row["status"] in {"completed", "archived"},
+        ):
+            update_task_status(task_row, "completed")
+            st.success("Guided task marked as completed.")
+            st.rerun()
+
+
 def render_tasks_page():
     st.title("My Tasks")
-    top_left, top_right = st.columns([3, 1])
-
-    with top_left:
-        st.caption("Tasks ordered by due date, from latest to earliest.")
-
-    with top_right:
-        if st.button("Add Task", type="primary", use_container_width=True):
-            new_task_form()
 
     try:
         tasks_df = get_tasks_dataframe()
+        guided_task_context = get_guided_task_context(tasks_df)
+        guided_mode_active = guided_task_context is not None
+        top_left, top_right = st.columns([3, 1])
+
+        with top_left:
+            if guided_mode_active:
+                st.warning(guided_task_context["reason"])
+            else:
+                st.caption("Tasks ordered by due date, from latest to earliest.")
+
+        with top_right:
+            if st.button(
+                "Add Task",
+                type="primary",
+                use_container_width=True,
+                disabled=guided_mode_active,
+            ):
+                new_task_form()
+
         if tasks_df.empty:
             st.info("You do not have any tasks yet.")
             return
@@ -2300,10 +2471,22 @@ def render_tasks_page():
             "display_due_date",
             "display_title",
         ]
-        show_routines = st.toggle("Show routines", value=False)
+        show_routines = st.toggle(
+            "Show routines",
+            value=False,
+            disabled=guided_mode_active,
+        )
+        if guided_mode_active:
+            show_routines = False
         filtered_tasks_df = tasks_df[
             tasks_df["is_routine"] == show_routines
         ].reset_index(drop=True)
+
+        if guided_mode_active:
+            guided_instance_id = guided_task_context["task"]["instance_id"]
+            filtered_tasks_df = filtered_tasks_df[
+                filtered_tasks_df["instance_id"] == guided_instance_id
+            ].reset_index(drop=True)
 
         if filtered_tasks_df.empty:
             empty_label = "routines" if show_routines else "actions"
@@ -2363,48 +2546,54 @@ def render_tasks_page():
         )
 
         selected_row = get_aggrid_selected_row(grid_response)
+        if guided_mode_active:
+            selected_row = guided_task_context["task"]
 
         if selected_row:
-            st.caption(f"Selected task: {selected_row['title']}")
+            if not guided_mode_active:
+                st.caption(f"Selected task: {selected_row['title']}")
 
-            is_parent_task = bool(selected_row.get("has_subtasks"))
-            action_columns = st.columns(4 if is_parent_task else 5)
-            next_action_column = 0
+            if guided_mode_active:
+                render_guided_task_actions(selected_row)
+            else:
+                is_parent_task = bool(selected_row.get("has_subtasks"))
+                action_columns = st.columns(4 if is_parent_task else 5)
+                next_action_column = 0
 
-            if not is_parent_task:
+                if not is_parent_task:
+                    with action_columns[next_action_column]:
+                        if st.button(
+                            "Open",
+                            use_container_width=True,
+                            disabled=selected_row["status"] in {"completed", "archived"},
+                        ):
+                            st.session_state[OPEN_TASK_DIALOG_TASK_KEY] = selected_row
+                    next_action_column += 1
+
                 with action_columns[next_action_column]:
                     if st.button(
-                        "Open",
+                        "Edit task",
                         use_container_width=True,
                         disabled=selected_row["status"] in {"completed", "archived"},
                     ):
-                        st.session_state[OPEN_TASK_DIALOG_TASK_KEY] = selected_row
+                        edit_task_form(selected_row)
                 next_action_column += 1
 
-            with action_columns[next_action_column]:
-                if st.button(
-                    "Edit task",
-                    use_container_width=True,
-                    disabled=selected_row["status"] in {"completed", "archived"},
-                ):
-                    edit_task_form(selected_row)
-            next_action_column += 1
+                with action_columns[next_action_column]:
+                    if st.button("Delete task", use_container_width=True):
+                        delete_task_dialog(selected_row)
+                next_action_column += 1
 
-            with action_columns[next_action_column]:
-                if st.button("Delete task", use_container_width=True):
-                    delete_task_dialog(selected_row)
-            next_action_column += 1
+                with action_columns[next_action_column]:
+                    if st.button("Create subtask", use_container_width=True):
+                        new_task_form(parent_task=selected_row)
+                next_action_column += 1
 
-            with action_columns[next_action_column]:
-                if st.button("Create subtask", use_container_width=True):
-                    new_task_form(parent_task=selected_row)
-            next_action_column += 1
-
-            with action_columns[next_action_column]:
-                 if st.button("Mark as done", use_container_width=True):
-                    update_task_status(selected_row, "completed")
-                    st.success("Task marked as completed.")
-                    st.rerun()
+                with action_columns[next_action_column]:
+                     if st.button("Mark as done", use_container_width=True):
+                        update_task_status(selected_row, "completed")
+                        st.success("Task marked as completed.")
+                        st.rerun()
 
         open_dialog_task = st.session_state.get(OPEN_TASK_DIALOG_TASK_KEY)
         if open_dialog_task:
