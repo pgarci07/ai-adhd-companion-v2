@@ -12,6 +12,7 @@ import pandas as pd
 from datetime import datetime, time, timedelta, date
 import pytz # Recomendado para manejo de zonas horarias
 from st_aggrid import AgGrid, GridOptionsBuilder
+from app.ui import body_doubling
 from app.ui.state.timers import (
     INACTIVITY_TIMER_KEY,
     WORK_TIMER_KEY,
@@ -158,6 +159,10 @@ def reset_auth_state():
     st.session_state.pop(SPRINT_REVIEW_PENDING_KEY, None)
     st.session_state.pop(REST_MESSAGE_KEY, None)
     st.session_state.pop(REST_MESSAGE_EXPIRES_AT_KEY, None)
+    st.session_state.pop(body_doubling.BODY_DOUBLING_FLOW_KEY, None)
+    st.session_state.pop(body_doubling.BODY_DOUBLING_SCOPE_DIALOG_KEY, None)
+    st.session_state.pop(body_doubling.BODY_DOUBLING_REVIEW_DIALOG_KEY, None)
+    st.session_state.pop(body_doubling.BODY_DOUBLING_EXTRA_STEP_DIALOG_KEY, None)
     st.session_state.pop(INACTIVITY_TIMER_KEY, None)
     st.session_state.pop(WORK_TIMER_KEY, None)
     st.session_state["session_expected_work_time"] = None
@@ -719,6 +724,18 @@ def append_timer_log_line(message):
     timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
     with TIMER_LOG_PATH.open("a", encoding="utf-8") as log_file:
         log_file.write(f"{timestamp} INFO {message}\n")
+
+
+def get_body_doubling_services():
+    return body_doubling.BodyDoublingServices(
+        get_user_preferences=get_user_preferences,
+        update_task_status=update_task_status,
+        log_openai_event=log_openai_event,
+        get_openai_logger=get_openai_logger,
+        extract_openai_text=extract_openai_text,
+        openai_class=OpenAI,
+        openai_model=OPENAI_MODEL,
+    )
 
 
 def load_registration_welcome_prompt():
@@ -1326,10 +1343,10 @@ def get_tasks_dataframe():
         axis=1,
     )
 
-    # --- sort parent tasks by priority and keep subtasks under their parent ---
+    # --- sort parent tasks by due date ascending and keep subtasks under their parent ---
     sorted_dataframe = dataframe.sort_values(
-        by=["Urgency", "due_date"],
-        ascending=[False, True]
+        by=["due_date", "Urgency"],
+        ascending=[True, False]
     ).reset_index(drop=True)
     children_by_parent = {}
     ordered_indices = []
@@ -2213,17 +2230,24 @@ def complete_open_task_flow(context):
     st.session_state["use_body_doubling"] = use_body_doubling
     update_task_status(task_row, "open")
     reset_work_timer_for_open_task(use_pomodoro_sprints)
-    with st.spinner("Preparing task support..."):
-        set_open_task_guidance_message(
-            generate_open_task_guidance_message(
-                task_row=task_row,
-                use_pomodoro_sprints=use_pomodoro_sprints,
-                use_body_doubling=use_body_doubling,
-                duration_minutes=duration_minutes,
+    if use_body_doubling:
+        with st.spinner("Preparing Body-Doubling support..."):
+            body_doubling.start_body_doubling_flow(task_row, get_body_doubling_services())
+    else:
+        with st.spinner("Preparing task support..."):
+            set_open_task_guidance_message(
+                generate_open_task_guidance_message(
+                    task_row=task_row,
+                    use_pomodoro_sprints=use_pomodoro_sprints,
+                    use_body_doubling=use_body_doubling,
+                    duration_minutes=duration_minutes,
+                )
             )
-        )
     clear_open_task_dialog_state()
-    st.success("Task opened.")
+    if use_body_doubling:
+        st.success("Task opened with Body-Doubling.")
+    else:
+        st.success("Task opened.")
     st.rerun()
 
 
@@ -2466,10 +2490,22 @@ def render_tasks_page():
             st.info("You do not have any tasks yet.")
             return
 
-        preferred_column_order = [
-            "display_start_date",
-            "display_due_date",
+        default_visible_columns = [
             "display_title",
+            "display_due_date",
+            "status",
+            "WOBJ",
+        ]
+        all_fields_visible_columns = [
+            "display_title",
+            "display_due_date",
+            "status",
+            "WOBJ",
+            "Urgency",
+            "WSUB",
+            "size_minutes",
+            "display_start_date",
+            "rrule",
         ]
         show_routines = st.toggle(
             "Show routines",
@@ -2493,19 +2529,19 @@ def render_tasks_page():
             st.info(f"You do not have any {empty_label} yet.")
             return
 
-        remaining_columns = [
-            column_name
-            for column_name in filtered_tasks_df.columns
-            if column_name not in preferred_column_order
-        ]
         show_all_columns = st.toggle("Show all task fields", value=False)
         visible_columns = (
-            preferred_column_order + remaining_columns
+            all_fields_visible_columns
             if show_all_columns
-            else preferred_column_order
+            else default_visible_columns
         )
+        ordered_grid_columns = visible_columns + [
+            column_name
+            for column_name in filtered_tasks_df.columns
+            if column_name not in visible_columns
+        ]
 
-        grid_df = filtered_tasks_df.copy()
+        grid_df = filtered_tasks_df[ordered_grid_columns].copy()
         grid_builder = GridOptionsBuilder.from_dataframe(grid_df)
         grid_builder.configure_selection(
             selection_mode="single",
@@ -2521,6 +2557,9 @@ def render_tasks_page():
         grid_builder.configure_column(
             "display_title",
             header_name="Title",
+            width=360,
+            minWidth=300,
+            flex=2,
             cellStyle={"fontWeight": "bold"},
         )
         grid_builder.configure_column("display_due_date", header_name="Due date")
@@ -2529,6 +2568,8 @@ def render_tasks_page():
         grid_builder.configure_column("WOBJ", header_name="WOBJ")
         grid_builder.configure_column("WSUB", header_name="WSUB")
         grid_builder.configure_column("Urgency", header_name="Urgency")
+        grid_builder.configure_column("size_minutes", header_name="Size_minutes")
+        grid_builder.configure_column("rrule", header_name="rrule")
         grid_builder.configure_grid_options(domLayout="normal")
 
         grid_response = AgGrid(
@@ -2551,7 +2592,11 @@ def render_tasks_page():
 
         if selected_row:
             if not guided_mode_active:
-                st.caption(f"Selected task: {selected_row['title']}")
+                selected_description = (selected_row.get("description") or "").strip()
+                if selected_description:
+                    st.caption(f"{selected_row['title']}: {selected_description}")
+                else:
+                    st.caption(selected_row["title"])
 
             if guided_mode_active:
                 render_guided_task_actions(selected_row)
@@ -2931,14 +2976,18 @@ if hasattr(st, "fragment"):
     def render_inactivity_logout_watcher():
         tick_inactivity_logout_timer(user_interaction=False)
         tick_work_timer()
+        body_doubling.move_body_doubling_flow_to_review_if_needed()
         clear_expired_open_task_guidance_message()
         clear_expired_rest_message()
+        body_doubling.render_body_doubling_session_overlay(get_body_doubling_services())
 else:
     def render_inactivity_logout_watcher():
         tick_inactivity_logout_timer(user_interaction=False)
         tick_work_timer()
+        body_doubling.move_body_doubling_flow_to_review_if_needed()
         clear_expired_open_task_guidance_message()
         clear_expired_rest_message()
+        body_doubling.render_body_doubling_session_overlay(get_body_doubling_services())
 
 
 # Verificamos si hay sesión activa al cargar
@@ -2950,12 +2999,21 @@ if st.session_state.get("user_id"):
     ensure_fresh_auth_session()
     tick_inactivity_logout_timer(user_interaction=True)
 
+
 # --- FLUJO PRINCIPAL ---
 if st.session_state["user_id"]:
         # ESTO ES LO QUE VE EL USUARIO LOGUEADO
     try:
         render_inactivity_logout_watcher()
-        if st.session_state.get(SPRINT_REVIEW_PENDING_KEY):
+        if body_doubling.should_render_body_doubling_session_only():
+            st.stop()
+        if st.session_state.get(body_doubling.BODY_DOUBLING_EXTRA_STEP_DIALOG_KEY):
+            body_doubling.render_body_doubling_extra_step_dialog(get_body_doubling_services())
+        elif st.session_state.get(body_doubling.BODY_DOUBLING_REVIEW_DIALOG_KEY):
+            body_doubling.render_body_doubling_review_dialog(get_body_doubling_services())
+        elif st.session_state.get(body_doubling.BODY_DOUBLING_SCOPE_DIALOG_KEY):
+            body_doubling.render_body_doubling_scope_dialog(get_body_doubling_services())
+        elif st.session_state.get(SPRINT_REVIEW_PENDING_KEY):
             render_sprint_review_dialog()
         elif st.session_state.get(REST_MESSAGE_EXPIRES_AT_KEY) is not None:
             render_rest_message_dialog()
