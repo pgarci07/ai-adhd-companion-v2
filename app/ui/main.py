@@ -3,16 +3,27 @@ import os
 import json
 import base64
 import logging
+import warnings
+import hashlib
+import inspect
 from pathlib import Path
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+
+# Some third-party Streamlit components still rely on the legacy `st.cache`
+# decorator internally. We don't use it in this app anymore, but we silence
+# that specific deprecation warning to keep the UI launch clean.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*`st\.cache` is deprecated.*",
+)
 
 import streamlit as st
 import pandas as pd
 from datetime import datetime, time, timedelta, date
 import pytz # Recomendado para manejo de zonas horarias
 from st_aggrid import AgGrid, GridOptionsBuilder
-from app.ui import body_doubling
+from app.ui import body_doubling, audio_support
 from app.ui.state.timers import (
     INACTIVITY_TIMER_KEY,
     WORK_TIMER_KEY,
@@ -60,6 +71,10 @@ TIMER_LOG_PATH = Path(__file__).resolve().parents[2] / "logs" / "timers.log"
 INACTIVITY_LOGOUT_SECONDS = 15 * 60
 WORK_TIMER_SECONDS = 20 * 60
 WORK_TIMER_EXPIRY_STATE_NAME = "Distracted"
+VOICE_MESSAGE_CACHE_KEY = "voice_message_audio_cache"
+MINUTE_CHIME_STATE_KEY = "minute_chime_state"
+MINUTE_CHIME_PENDING_TOKEN_KEY = "minute_chime_pending_token"
+MINUTE_CHIME_RENDERED_TOKEN_KEY = "minute_chime_rendered_token"
 
 # Inicializo el user id en session state para evitar errores
 if "user_id" not in st.session_state:
@@ -159,6 +174,10 @@ def reset_auth_state():
     st.session_state.pop(SPRINT_REVIEW_PENDING_KEY, None)
     st.session_state.pop(REST_MESSAGE_KEY, None)
     st.session_state.pop(REST_MESSAGE_EXPIRES_AT_KEY, None)
+    st.session_state.pop(VOICE_MESSAGE_CACHE_KEY, None)
+    st.session_state.pop(MINUTE_CHIME_STATE_KEY, None)
+    st.session_state.pop(MINUTE_CHIME_PENDING_TOKEN_KEY, None)
+    st.session_state.pop(MINUTE_CHIME_RENDERED_TOKEN_KEY, None)
     st.session_state.pop(body_doubling.BODY_DOUBLING_FLOW_KEY, None)
     st.session_state.pop(body_doubling.BODY_DOUBLING_SCOPE_DIALOG_KEY, None)
     st.session_state.pop(body_doubling.BODY_DOUBLING_REVIEW_DIALOG_KEY, None)
@@ -506,17 +525,13 @@ def reset_work_timer_for_open_task(use_pomodoro_sprints):
         else 29
     )
     callback = eoSprint if use_pomodoro_sprints else eoChunk
-    append_timer_log_line(
+    schedule_work_timer(
+        duration_minutes,
+        callback,
         (
-            "request_reset | timer=work_timer source=reset_work_timer_for_open_task "
-            f"use_pomodoro_sprints={use_pomodoro_sprints} "
-            f"duration_minutes={duration_minutes} callback={callback.__name__}"
-        )
-    )
-
-    get_work_timer(st.session_state).reset(
-        duration=duration_minutes * 60,
-        on_expiry=callback,
+            "reset_work_timer_for_open_task"
+            f" use_pomodoro_sprints={use_pomodoro_sprints}"
+        ),
     )
 
 
@@ -726,16 +741,181 @@ def append_timer_log_line(message):
         log_file.write(f"{timestamp} INFO {message}\n")
 
 
-def get_body_doubling_services():
-    return body_doubling.BodyDoublingServices(
-        get_user_preferences=get_user_preferences,
-        update_task_status=update_task_status,
-        log_openai_event=log_openai_event,
-        get_openai_logger=get_openai_logger,
-        extract_openai_text=extract_openai_text,
-        openai_class=OpenAI,
-        openai_model=OPENAI_MODEL,
+def get_voice_message_cache():
+    return st.session_state.setdefault(VOICE_MESSAGE_CACHE_KEY, {})
+
+
+def get_voice_message_cache_key(message_text, key_prefix):
+    message_digest = hashlib.sha1(str(message_text).encode("utf-8")).hexdigest()[:12]
+    return f"{key_prefix}:{message_digest}"
+
+
+def render_voice_message_button(message_text, key_prefix, *, label="Play voice message"):
+    cleaned_message = (message_text or "").strip()
+    if not cleaned_message:
+        return
+
+    cache_key = get_voice_message_cache_key(cleaned_message, key_prefix)
+    voice_cache = get_voice_message_cache()
+    cached_entry = voice_cache.get(cache_key, {})
+
+    if st.button(label, key=f"voice_button_{cache_key}", use_container_width=False):
+        audio_bytes, error_message = audio_support.convert_text_to_speech(cleaned_message)
+        voice_cache[cache_key] = {
+            "audio_bytes": audio_bytes,
+            "error_message": error_message,
+        }
+        cached_entry = voice_cache[cache_key]
+
+    if cached_entry.get("error_message"):
+        st.info(cached_entry["error_message"])
+    elif cached_entry.get("audio_bytes"):
+        st.audio(cached_entry["audio_bytes"], format="audio/mp3")
+
+
+def get_enable_minute_chime_preference():
+    return bool(get_user_preferences().get("enable_minute_chime", True))
+
+
+def schedule_work_timer(duration_minutes, on_expiry, source_label):
+    append_timer_log_line(
+        (
+            "request_reset | timer=work_timer "
+            f"source={source_label} duration_minutes={duration_minutes} "
+            f"callback={getattr(on_expiry, '__name__', type(on_expiry).__name__)}"
+        )
     )
+    get_work_timer(st.session_state).reset(
+        duration=int(duration_minutes) * 60,
+        on_expiry=on_expiry,
+    )
+
+
+def get_work_timer_snapshot():
+    return get_work_timer(st.session_state).snapshot()
+
+
+def get_active_focus_timer_context():
+    body_doubling_flow = body_doubling.get_body_doubling_flow()
+    if body_doubling_flow and body_doubling_flow.get("phase") == "session":
+        duration_seconds = int((body_doubling_flow.get("session_duration_minutes") or 1) * 60)
+        if body_doubling_flow.get("timer_source") == "work_timer":
+            timer_snapshot = get_work_timer_snapshot()
+            if not timer_snapshot.running or timer_snapshot.expires_at is None:
+                return None
+            duration_seconds = int(timer_snapshot.duration_seconds or duration_seconds)
+            remaining_seconds = max(0, int(timer_snapshot.expires_at - datetime.now(pytz.UTC).timestamp()))
+            started_at = (
+                float(timer_snapshot.expires_at) - float(timer_snapshot.duration_seconds)
+                if timer_snapshot.duration_seconds is not None
+                else body_doubling_flow.get("session_started_at")
+            )
+            signature = (
+                "body_doubling:work_timer:"
+                f"{body_doubling_flow['task'].get('instance_id')}:{timer_snapshot.expires_at}"
+            )
+        else:
+            session_ends_at = body_doubling_flow.get("session_ends_at")
+            started_at = body_doubling_flow.get("session_started_at")
+            if session_ends_at is None or started_at is None:
+                return None
+            remaining_seconds = max(0, int(float(session_ends_at) - datetime.now(pytz.UTC).timestamp()))
+            signature = (
+                "body_doubling:micro_session:"
+                f"{body_doubling_flow['task'].get('instance_id')}:{started_at}"
+            )
+
+        elapsed_seconds = max(0, duration_seconds - remaining_seconds)
+        return {
+            "signature": signature,
+            "elapsed_minutes": elapsed_seconds // 60,
+            "remaining_seconds": remaining_seconds,
+        }
+
+    timer_snapshot = get_work_timer_snapshot()
+    if not timer_snapshot.running or timer_snapshot.expires_at is None:
+        return None
+
+    duration_seconds = int(timer_snapshot.duration_seconds or 0)
+    remaining_seconds = max(0, int(timer_snapshot.expires_at - datetime.now(pytz.UTC).timestamp()))
+    elapsed_seconds = max(0, duration_seconds - remaining_seconds)
+    return {
+        "signature": f"work_timer:{timer_snapshot.expires_at}:{duration_seconds}",
+        "elapsed_minutes": elapsed_seconds // 60,
+        "remaining_seconds": remaining_seconds,
+    }
+
+
+def maybe_schedule_minute_chime():
+    if not get_enable_minute_chime_preference():
+        return
+
+    timer_context = get_active_focus_timer_context()
+    chime_state = st.session_state.setdefault(
+        MINUTE_CHIME_STATE_KEY,
+        {"signature": None, "last_elapsed_minute": 0},
+    )
+
+    if timer_context is None:
+        chime_state["signature"] = None
+        chime_state["last_elapsed_minute"] = 0
+        return
+
+    if chime_state.get("signature") != timer_context["signature"]:
+        chime_state["signature"] = timer_context["signature"]
+        chime_state["last_elapsed_minute"] = 0
+
+    elapsed_minutes = int(timer_context["elapsed_minutes"])
+    if elapsed_minutes < 1 or timer_context["remaining_seconds"] <= 0:
+        return
+
+    if elapsed_minutes == chime_state.get("last_elapsed_minute"):
+        return
+
+    chime_state["last_elapsed_minute"] = elapsed_minutes
+    st.session_state[MINUTE_CHIME_PENDING_TOKEN_KEY] = (
+        f"{timer_context['signature']}:{elapsed_minutes}"
+    )
+
+
+def render_pending_minute_chime():
+    pending_token = st.session_state.get(MINUTE_CHIME_PENDING_TOKEN_KEY)
+    if not pending_token:
+        return
+
+    if pending_token == st.session_state.get(MINUTE_CHIME_RENDERED_TOKEN_KEY):
+        return
+
+    st.markdown(
+        audio_support.build_hidden_autoplay_audio_html(
+            audio_support.build_minute_chime_wav_bytes(),
+            "audio/wav",
+        ),
+        unsafe_allow_html=True,
+    )
+    st.session_state[MINUTE_CHIME_RENDERED_TOKEN_KEY] = pending_token
+
+
+def get_body_doubling_services():
+    service_kwargs = {
+        "get_user_preferences": get_user_preferences,
+        "update_task_status": update_task_status,
+        "log_openai_event": log_openai_event,
+        "get_openai_logger": get_openai_logger,
+        "extract_openai_text": extract_openai_text,
+        "openai_class": OpenAI,
+        "openai_model": OPENAI_MODEL,
+        "schedule_work_timer": schedule_work_timer,
+        "disable_work_timer": disable_work_timer,
+        "get_work_timer_snapshot": get_work_timer_snapshot,
+    }
+    accepted_parameters = inspect.signature(body_doubling.BodyDoublingServices).parameters
+    compatible_kwargs = {
+        key: value
+        for key, value in service_kwargs.items()
+        if key in accepted_parameters
+    }
+    return body_doubling.BodyDoublingServices(**compatible_kwargs)
 
 
 def load_registration_welcome_prompt():
@@ -1020,6 +1200,7 @@ def load_user_profile_cache():
         "preferences": {
             "average_session_time": 120,
             "custom_sizes": [15, 30, 60, 180, 720],
+            "enable_minute_chime": True,
         },
     }
     user_id = st.session_state.get("user_id")
@@ -1060,6 +1241,10 @@ def load_user_profile_cache():
                 default_profile["preferences"]["average_session_time"],
             ),
             "custom_sizes": custom_sizes,
+            "enable_minute_chime": preferences.get(
+                "enable_minute_chime",
+                default_profile["preferences"]["enable_minute_chime"],
+            ),
         },
     }
     st.session_state["user_profile"] = normalized_profile
@@ -2222,18 +2407,24 @@ def build_open_task_context(task_row, pomodoro_choice, body_doubling_choice):
 
 
 def complete_open_task_flow(context):
-    task_row = context["task_row"]
+    task_row = dict(context["task_row"])
     use_pomodoro_sprints = context["use_pomodoro_sprints"]
     use_body_doubling = context["use_body_doubling"]
     duration_minutes = context["duration_minutes"]
 
     st.session_state["use_body_doubling"] = use_body_doubling
     update_task_status(task_row, "open")
-    reset_work_timer_for_open_task(use_pomodoro_sprints)
     if use_body_doubling:
         with st.spinner("Preparing Body-Doubling support..."):
-            body_doubling.start_body_doubling_flow(task_row, get_body_doubling_services())
+            body_doubling.start_body_doubling_flow(
+                {
+                    **task_row,
+                    "use_pomodoro_sprints": use_pomodoro_sprints,
+                },
+                get_body_doubling_services(),
+            )
     else:
+        reset_work_timer_for_open_task(use_pomodoro_sprints)
         with st.spinner("Preparing task support..."):
             set_open_task_guidance_message(
                 generate_open_task_guidance_message(
@@ -2300,6 +2491,8 @@ def open_task_dialog(task_row):
         index=None,
         placeholder="Choose yes or no",
     )
+    if pomodoro_choice == "Yes" and body_doubling_choice == "Yes":
+        st.info("Pomodoro will manage the timer. Body-Doubling will handle supportive guidance and review without starting a second countdown.")
 
     if st.button("OK", type="primary", use_container_width=True):
         if pomodoro_choice is None or body_doubling_choice is None:
@@ -2337,6 +2530,7 @@ def open_task_guidance_dialog():
         return
 
     st.write(message)
+    render_voice_message_button(message, "open_task_guidance")
     st.caption("This message will close automatically in 15 seconds.")
 
 
@@ -2409,6 +2603,7 @@ def rest_message_dialog():
         return
 
     st.write(message)
+    render_voice_message_button(message, "rest_message")
     st.caption("This message will close automatically in 15 seconds.")
 
 
@@ -2703,6 +2898,10 @@ def render_preferences_page():
             "Enable notifications",
             value=bool(preferences.get("notifications", True)),
         )
+        enable_minute_chime = st.checkbox(
+            "Enable minute chime",
+            value=bool(preferences.get("enable_minute_chime", True)),
+        )
 
         if st.form_submit_button("Save preferences", type="primary"):
             if not selected_state:
@@ -2718,6 +2917,7 @@ def render_preferences_page():
                         "language": language.strip() or preferences.get("language", "english"),
                         "time-mgmt": time_management.strip() or preferences.get("time-mgmt", "Pomodoro"),
                         "notifications": notifications,
+                        "enable_minute_chime": enable_minute_chime,
                     },
                     state_id=selected_state["id"],
                 )
@@ -2888,6 +3088,7 @@ def registration_form():
                         "sprint": 30,
                         "time-mgmt":"Pomodoro",
                         "notifications": True,
+                        "enable_minute_chime": True,
                     }
                     born_date = to_supabase_date(born)
 
@@ -2979,6 +3180,8 @@ if hasattr(st, "fragment"):
         body_doubling.move_body_doubling_flow_to_review_if_needed()
         clear_expired_open_task_guidance_message()
         clear_expired_rest_message()
+        maybe_schedule_minute_chime()
+        render_pending_minute_chime()
         body_doubling.render_body_doubling_session_overlay(get_body_doubling_services())
 else:
     def render_inactivity_logout_watcher():
@@ -2987,6 +3190,8 @@ else:
         body_doubling.move_body_doubling_flow_to_review_if_needed()
         clear_expired_open_task_guidance_message()
         clear_expired_rest_message()
+        maybe_schedule_minute_chime()
+        render_pending_minute_chime()
         body_doubling.render_body_doubling_session_overlay(get_body_doubling_services())
 
 

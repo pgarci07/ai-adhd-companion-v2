@@ -32,6 +32,9 @@ class BodyDoublingServices:
     extract_openai_text: Callable[[Any], str | None]
     openai_class: Any
     openai_model: str
+    schedule_work_timer: Callable[[int, Callable[..., None], str], None]
+    disable_work_timer: Callable[[], None]
+    get_work_timer_snapshot: Callable[[], Any]
 
 
 def extract_json_block(text):
@@ -413,6 +416,7 @@ def prepare_body_doubling_setup(flow, services: BodyDoublingServices):
 
 
 def start_body_doubling_flow(task_row, services: BodyDoublingServices):
+    uses_pomodoro_timer = bool(task_row.get("use_pomodoro_sprints"))
     flow = {
         "task": task_row,
         "phase": "setup",
@@ -423,7 +427,10 @@ def start_body_doubling_flow(task_row, services: BodyDoublingServices):
         "session_message": None,
         "custom_microstep_descriptions": [],
         "pending_terminal_action": None,
+        "uses_pomodoro_timer": uses_pomodoro_timer,
+        "timer_source": "work_timer" if uses_pomodoro_timer else "body_doubling",
     }
+    services.disable_work_timer()
 
     wsub_value = task_row.get("WSUB")
     try:
@@ -450,6 +457,10 @@ def get_body_doubling_duration_options(services: BodyDoublingServices, flow):
     options = []
     if flow.get("uses_microsteps"):
         options.append("Skip")
+    if flow.get("uses_pomodoro_timer"):
+        options.append(f"{sprint_minutes} min (Sprint)")
+        return options
+
     options.extend(["5 min", "10 min", "15 min", f"{sprint_minutes} min (Sprint)"])
     return options
 
@@ -535,10 +546,28 @@ def advance_body_doubling_microstep(flow, services: BodyDoublingServices):
 def start_body_doubling_micro_session(flow, duration_minutes, services: BodyDoublingServices):
     current_target = get_current_body_doubling_target(flow, services)
     started_at = datetime.now(pytz.UTC).timestamp()
+    timer_source = "work_timer" if flow.get("uses_pomodoro_timer") else "body_doubling"
+
+    if flow.get("uses_pomodoro_timer"):
+        services.schedule_work_timer(
+            int(duration_minutes),
+            expire_body_doubling_pomodoro_session,
+            "body_doubling_pomodoro_session",
+        )
+        timer_snapshot = services.get_work_timer_snapshot()
+        expires_at = timer_snapshot.expires_at
+        if timer_snapshot.duration_seconds is not None and expires_at is not None:
+            started_at = float(expires_at) - float(timer_snapshot.duration_seconds)
+        else:
+            expires_at = started_at + (int(duration_minutes) * 60)
+    else:
+        expires_at = started_at + (int(duration_minutes) * 60)
+
     flow["phase"] = "session"
     flow["session_duration_minutes"] = int(duration_minutes)
     flow["session_started_at"] = started_at
-    flow["session_ends_at"] = started_at + (int(duration_minutes) * 60)
+    flow["session_ends_at"] = expires_at
+    flow["timer_source"] = timer_source
     flow["current_target_name"] = current_target["name"] if current_target else flow["task"]["title"]
     flow["current_target_description"] = current_target["description"] if current_target else flow["task"].get("description")
     flow["current_target_estimated_minutes"] = (
@@ -553,9 +582,23 @@ def start_body_doubling_micro_session(flow, duration_minutes, services: BodyDoub
     st.rerun()
 
 
+def expire_body_doubling_pomodoro_session(timer=None):
+    flow = get_body_doubling_flow()
+    if not flow or flow.get("phase") != "session":
+        return
+
+    flow["phase"] = "review"
+    set_body_doubling_flow(flow)
+    st.session_state[BODY_DOUBLING_REVIEW_DIALOG_KEY] = True
+    st.rerun()
+
+
 def move_body_doubling_flow_to_review_if_needed():
     flow = get_body_doubling_flow()
     if not flow or flow.get("phase") != "session":
+        return
+
+    if flow.get("timer_source") == "work_timer":
         return
 
     session_ends_at = flow.get("session_ends_at")
@@ -574,6 +617,9 @@ def body_doubling_scope_dialog(services: BodyDoublingServices):
     flow = get_body_doubling_flow()
     if not flow:
         return
+
+    if flow.get("uses_pomodoro_timer"):
+        st.info("Pomodoro is managing the countdown for this session. Body-Doubling is only guiding the task and review flow.")
 
     if flow.get("uses_microsteps"):
         microsteps = flow.get("microsteps") or []
@@ -688,7 +734,15 @@ def render_body_doubling_session_overlay(services: BodyDoublingServices):
         return
 
     now_timestamp = datetime.now(pytz.UTC).timestamp()
-    remaining_seconds = max(0, int(flow["session_ends_at"] - now_timestamp))
+    if flow.get("timer_source") == "work_timer":
+        timer_snapshot = services.get_work_timer_snapshot()
+        if not timer_snapshot.running or timer_snapshot.expires_at is None:
+            return
+        remaining_seconds = max(0, int(timer_snapshot.expires_at - now_timestamp))
+        total_seconds = max(1, int(timer_snapshot.duration_seconds or (flow.get("session_duration_minutes") or 1) * 60))
+    else:
+        remaining_seconds = max(0, int(flow["session_ends_at"] - now_timestamp))
+        total_seconds = max(1, int((flow.get("session_duration_minutes") or 1) * 60))
     hide_message = (
         flow.get("session_started_at") is not None
         and now_timestamp - float(flow["session_started_at"]) >= BODY_DOUBLING_ZONE3_SECONDS
@@ -702,7 +756,6 @@ def render_body_doubling_session_overlay(services: BodyDoublingServices):
         0,
         int(now_timestamp - float(flow.get("session_started_at") or now_timestamp))
     )
-    total_seconds = max(1, int((flow.get("session_duration_minutes") or 1) * 60))
     progress_percentage = min(100, max(0, int((elapsed_seconds / total_seconds) * 100)))
     minutes = remaining_seconds // 60
     seconds = remaining_seconds % 60
@@ -903,7 +956,7 @@ def render_body_doubling_session_overlay(services: BodyDoublingServices):
                         {zone2_html}
                         <div class="body-doubling-metadata">
                             <span class="body-doubling-pill">Session elapsed: {elapsed_seconds}s</span>
-                            <span class="body-doubling-pill">Remaining: {remaining_seconds}s</span>
+                            <span class="body-doubling-pill">Timer source: {'Pomodoro' if flow.get('timer_source') == 'work_timer' else 'Micro-session'}</span>
                         </div>
                     </div>
                 </div>
