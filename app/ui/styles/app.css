@@ -1,0 +1,356 @@
+/* Used globally by the main Streamlit pages to remove the default top gap. */
+.block-container {
+    padding-top: 0rem;
+}
+
+/* Used by all Streamlit dialogs; currently affects New task and Edit task. */
+div[data-testid="stDialog"] label,
+div[data-testid="stDialog"] [data-testid="stWidgetLabel"] p {
+    font-size: 14px;
+}
+
+/* Simple review/setup dialogs read better with a softer title treatment. */
+div[data-testid="stDialog"] [data-testid="stDialogHeader"],
+div[data-testid="stDialog"] [data-testid="stDialogHeader"] *,
+div[data-testid="stDialog"] div[role="dialog"] > div:first-child,
+div[data-testid="stDialog"] div[role="dialog"] > div:first-child * {
+    color: rgba(34, 49, 63, 0.5) !important;
+}
+
+/* Used by the Task support dialog to make the guidance copy easier to read. */
+div[data-testid="stDialog"] .task-support-message {
+    font-family: Calibri, "Segoe UI", Arial, sans-serif;
+    font-size: 18px;
+    line-height: 1.5;
+    margin: 1.1rem 0 2.25rem 0;
+}
+
+/* Used by the Task support dialog so multi-paragraph OpenAI replies breathe. */
+div[data-testid="stDialog"] .task-support-message p {
+    margin: 0 0 1rem 0;
+}
+
+div[data-testid="stDialog"] .task-support-message p:last-child {
+    margin-bottom: 0;
+}
+
+/* Used by the logout farewell so the OpenAI message feels more reflective. */
+div[data-testid="stDialog"] .logout-farewell-message {
+    font-style: italic;
+    font-size: 20px;
+}
+
+/* Used by short review/status notes inside simple dialogs. */
+div[data-testid="stDialog"] .review-status-note {
+    margin: 0 0 1rem 0;
+}
+
+/* Used by Edit task and other standard-width dialogs. */
+div[data-testid="stDialog"] div[role="dialog"] {
+    width: min(96vw, 1040px);
+    max-width: min(96vw, 1040px);
+}
+
+/* Used by registration_form() to size the account creation dialog from the browser viewport. */
+div[data-testid="stDialog"]:has(.registration-form-anchor) > div[role="dialog"],
+div[data-testid="stDialog"]:has(.registration-form-anchor) [role="dialog"] {
+    width: clamp(360px, 64vw, 832px);
+    max-width: calc(100vw - 2rem);
+}
+
+/* Used by login_form() to size the sign-in dialog from the browser viewport. */
+div[data-testid="stDialog"]:has(.login-form-anchor) > div[role="dialog"],
+div[data-testid="stDialog"]:has(.login-form-anchor) [role="dialog"] {
+    width: clamp(340px, 56vw, 700px);
+    max-width: calc(100vw - 2rem);
+}
+
+/* Used by welcome_session_dialog() to size the initial session dialog from the browser viewport. */
+div[data-testid="stDialog"]:has(.welcome-form-anchor) > div[role="dialog"],
+div[data-testid="stDialog"]:has(.welcome-form-anchor) [role="dialog"] {
+    width: clamp(360px, 64vw, 832px);
+    max-width: calc(100vw - 2rem);
+}
+
+/* Used by open_task_dialog() to keep the task-start dialog narrower. */
+div[data-testid="stDialog"]:has(.open-task-form-anchor) > div[role="dialog"],
+div[data-testid="stDialog"]:has(.open-task-form-anchor) [role="dialog"] {
+    width: min(96vw, 832px);
+    max-width: min(96vw, 832px);
+}
+
+/* Used by open_task_dialog() to show the selected task title without a label. */
+div[data-testid="stDialog"] .open-task-title {
+    font-size: 24px;
+    font-weight: 700;
+    color: #22313f;
+    line-height: 1.35;
+    margin: 0 0 1rem 0;
+}
+
+/* Used by body_doubling_setup_dialog() to emphasise the task title above the setup controls. */
+div[data-testid="stDialog"] .body-doubling-setup-task-title {
+    font-size: 20px;
+    font-weight: 700;
+    color: #22313f;
+    line-height: 1.35;
+    margin: 0 0 0.5rem 0;
+}
+
+/* Used by New task and Edit task to keep dense dialog layouts compact. */
+div[data-testid="stDialog"] div[data-testid="stVerticalBlock"] {
+    gap: 0.5rem;
+}
+
+/* Used by task dialogs so date/time/text controls align visually. */
+div[data-testid="stDialog"] div[data-testid="stTextInput"] input,
+div[data-testid="stDialog"] div[data-testid="stDateInput"] input,
+div[data-testid="stDialog"] div[data-testid="stTimeInput"] input {
+    min-height: 2.15rem;
+}
+
+/* Used by task-dialog notices so warnings consume less vertical space. */
+div[data-testid="stDialog"] div[data-testid="stAlert"] {
+    padding: 0.45rem 0.65rem;
+}
+
+/* Used by the new_task_form() dialog wrapper. */
+div[data-testid="stDialog"] .new-task-form-shell {
+    padding-top: 0.25rem;
+}
+
+/* Used by New task dialog when creating a subtask. */
+div[data-testid="stDialog"] .new-task-card {
+    border: 1px solid rgba(18, 58, 95, 0.10);
+    background: linear-gradient(180deg, #fbfdff 0%, #f3f8fc 100%);
+    border-radius: 18px;
+    padding: 0.85rem 1rem 0.2rem 1rem;
+    margin-bottom: 0.55rem;
+}
+
+/* Used by the "Subtask" kicker inside the New task dialog card. */
+div[data-testid="stDialog"] .new-task-kicker {
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #2d5d86;
+    margin-bottom: 0;
+}
+
+/* Used by the New task dialog; it is wider than the standard Edit task dialog. */
+div[data-testid="stDialog"]:has(.new-task-form-shell) > div[role="dialog"],
+div[data-testid="stDialog"]:has(.new-task-form-shell) [role="dialog"] {
+    width: min(1250px, 97vw);
+    max-width: 1250px;
+}
+
+/* Used by the My Tasks page title row that contains the search icon button. */
+div[data-testid="stHorizontalBlock"]:has(.my-tasks-title-anchor) {
+    align-items: center;
+}
+
+/* Used by the My Tasks title actions to right-align the buttons. */
+div[data-testid="stHorizontalBlock"]:has(.my-tasks-title-anchor) div[data-testid="stButton"] {
+    display: flex;
+    justify-content: flex-end;
+}
+
+/* Used by the My Tasks title icon buttons. */
+div[data-testid="stHorizontalBlock"]:has(.my-tasks-title-anchor) div[data-testid="stVerticalBlock"]:has(.my-tasks-add-anchor) div[data-testid="stButton"] > button,
+div[data-testid="stHorizontalBlock"]:has(.my-tasks-title-anchor) div[data-testid="stVerticalBlock"]:has(.my-tasks-search-anchor) div[data-testid="stButton"] > button {
+    width: 3rem;
+    min-width: 3rem;
+    height: 3rem;
+    padding: 0;
+    border-radius: 8px;
+    font-size: 1.65rem;
+    line-height: 1;
+}
+
+/* Used by the My Tasks Add Task icon button. */
+div[data-testid="stHorizontalBlock"]:has(.my-tasks-title-anchor) div[data-testid="stVerticalBlock"]:has(.my-tasks-add-anchor) div[data-testid="stButton"] > button {
+    background: #ff4b4b;
+    border-color: #ff4b4b;
+    color: #ffffff;
+}
+
+/* Used by the My Tasks Add Task icon button hover state. */
+div[data-testid="stHorizontalBlock"]:has(.my-tasks-title-anchor) div[data-testid="stVerticalBlock"]:has(.my-tasks-add-anchor) div[data-testid="stButton"] > button:hover {
+    background: #e53e3e;
+    border-color: #e53e3e;
+    color: #ffffff;
+}
+
+/* Used by the My Tasks search icon button. */
+div[data-testid="stHorizontalBlock"]:has(.my-tasks-title-anchor) div[data-testid="stVerticalBlock"]:has(.my-tasks-search-anchor) div[data-testid="stButton"] > button {
+    background: #ffffff;
+    color: #22313f;
+}
+
+/* Used by My Tasks title action markers so they do not add visible height. */
+.my-tasks-add-anchor,
+.my-tasks-search-anchor {
+    display: none;
+}
+
+/* Used by My Tasks filter strips to keep toggles close to their controls. */
+div[data-testid="stVerticalBlock"] div[data-testid="stToggle"] {
+    margin-bottom: -0.18rem;
+}
+
+/* Used by My Tasks completed-days filter next to the compact number input. */
+.completed-days-unit-label {
+    display: inline-flex;
+    align-items: center;
+    min-height: 2.45rem;
+    color: #263746;
+    font-size: 1rem;
+    line-height: 1;
+}
+
+/* Used by Streamlit help tooltips, including routine/preference help icons. */
+div[data-testid="stTooltipContent"] {
+    background-color: #eef4f8;
+    color: #263746;
+}
+
+/* Used by render_preferences_page() so form labels match checkbox label sizing. */
+div[data-testid="stForm"]:has(.preferences-form-anchor) label,
+div[data-testid="stForm"]:has(.preferences-form-anchor) [data-testid="stWidgetLabel"] p {
+    font-size: 16px;
+}
+
+/* Used by render_preferences_page() to make the form sections denser vertically. */
+div[data-testid="stForm"]:has(.preferences-form-anchor) div[data-testid="stVerticalBlock"] {
+    gap: 0.28rem;
+}
+
+/* Used by render_preferences_page() to make section headings smaller and tighter. */
+div[data-testid="stForm"]:has(.preferences-form-anchor) h3 {
+    font-size: 1.125rem;
+    margin: 0.12rem 0 0.18rem 0;
+    line-height: 1.2;
+}
+
+/* Used by render_preferences_page() to reduce excess spacing under input groups. */
+div[data-testid="stForm"]:has(.preferences-form-anchor) div[data-testid="column"] {
+    gap: 0.2rem;
+}
+
+/* Used by render_preferences_page() to add breathing room before checkbox rows. */
+div[data-testid="stForm"]:has(.preferences-form-anchor) div[data-testid="stCheckbox"] {
+    margin-top: 0.35rem;
+}
+
+/* Used by render_preferences_page() to keep alerts and helper text compact. */
+div[data-testid="stForm"]:has(.preferences-form-anchor) div[data-testid="stAlert"] {
+    margin: 0.15rem 0;
+    padding: 0.4rem 0.6rem;
+}
+
+/* Used by the authenticated sidebar shell in render_sidebar(). */
+[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+}
+
+/* Used by render_sidebar() to push My Account actions toward the bottom. */
+[data-testid="stSidebar"] .account-menu-spacer {
+    flex-grow: 1;
+    min-height: 2rem;
+}
+
+/* Used by the sidebar session/persona summary panel. */
+[data-testid="stSidebar"] .sidebar-panel {
+    border: 1px solid rgba(21, 53, 84, 0.08);
+    background: linear-gradient(180deg, #fbfdff 0%, #f2f7fc 100%);
+    border-radius: 18px;
+    padding: 0.95rem 0.95rem 0.8rem 0.95rem;
+    margin-bottom: 0.9rem;
+    box-shadow: 0 10px 30px rgba(28, 53, 84, 0.05);
+}
+
+/* Used by the sidebar "Session" label. */
+[data-testid="stSidebar"] .sidebar-kicker {
+    font-size: 0.72rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: #537492;
+    margin-bottom: 0.45rem;
+}
+
+/* Used by the sidebar persona name. */
+[data-testid="stSidebar"] .sidebar-profile-name {
+    font-size: 1rem;
+    font-weight: 700;
+    color: #22313f;
+    line-height: 1.25;
+    margin-bottom: 0.5rem;
+}
+
+/* Used by the sidebar row that contains state chips. */
+[data-testid="stSidebar"] .sidebar-chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+}
+
+/* Used by the sidebar state chip. */
+[data-testid="stSidebar"] .sidebar-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.32rem 0.58rem;
+    border-radius: 999px;
+    background: rgba(49, 102, 149, 0.10);
+    border: 1px solid rgba(49, 102, 149, 0.12);
+    color: #325d85;
+    font-size: 0.76rem;
+    font-weight: 700;
+    line-height: 1;
+}
+
+/* Used by render_sidebar() below the current state chip. */
+[data-testid="stSidebar"] .sidebar-state-description {
+    margin-top: 0.45rem;
+    color: #52687d;
+    font-size: 0.76rem;
+    line-height: 1.35;
+}
+
+/* Used by render_sidebar() to show the active adaptive task ordering. */
+[data-testid="stSidebar"] .sidebar-adaptive-priority {
+    margin-top: 0.28rem;
+    color: #6f8295;
+    font-size: 0.72rem;
+    line-height: 1.3;
+}
+
+/* Used by sidebar section headings such as Quick State and Navigation. */
+[data-testid="stSidebar"] .sidebar-section-title {
+    font-size: 0.76rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: #69819a;
+    margin: 0.15rem 0 0.45rem 0;
+}
+
+/* Used by all sidebar navigation/action buttons. */
+[data-testid="stSidebar"] div[data-testid="stButton"] > button {
+    border-radius: 14px;
+    min-height: 2.8rem;
+    border: 1px solid rgba(28, 57, 88, 0.10);
+    background: #ffffff;
+    color: #2b3b4b;
+    font-weight: 600;
+    box-shadow: 0 6px 18px rgba(31, 49, 69, 0.04);
+}
+
+/* Used by all sidebar navigation/action buttons on hover. */
+[data-testid="stSidebar"] div[data-testid="stButton"] > button:hover {
+    border-color: rgba(41, 97, 145, 0.20);
+    color: #234f78;
+}

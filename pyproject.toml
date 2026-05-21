@@ -1,0 +1,9 @@
+[project]
+name = "ai-adhd-companion"
+version = "0.1.0"
+description = "2026 Birbecks' Computer Science TFG"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

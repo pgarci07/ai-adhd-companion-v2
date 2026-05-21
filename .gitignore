@@ -1,0 +1,30 @@
+# Entorno Virtual y dependencias
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+
+# Secretos y Configuración (CRÍTICO)
+.env
+.streamlit/secrets.toml
+mi_supabase
+
+# Docker y Logs
+*.log
+docker-compose.override.yml
+
+# IDEs (VS Code)
+.vscode/
+
+# Sistema Operativo (Windows/Mac)
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Datos temporales
+data/
+*.csv
+*.json
+
+ 
