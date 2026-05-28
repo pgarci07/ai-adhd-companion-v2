@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
-"""Load the complete task test set for one authenticated Supabase user.
+"""Load the task test set for one authenticated Supabase user.
 
-This script orchestrates the three existing development helpers in the exact
-order requested for end-to-end test preparation:
+This script intentionally stops after the two data-loading stages:
 
 1. Load the simple-task CSV test set.
 2. Load the recurrent/composite task CSV test set.
-3. Mark very old instances as stale.
 
-Each stage is executed fully before the next one starts. Supabase commits every
-RPC/insert request immediately, so these stage boundaries act as the practical
-"transaction commit" checkpoints for the test workflow even though there is no
-single cross-request SQL transaction spanning the whole script.
+Scheduler invocation and stale-marking were split into a separate helper so the
+seed-loading workflow stays focused on creating test data only.
 """
 
 from __future__ import annotations
@@ -30,7 +26,6 @@ if str(REPO_ROOT) not in sys.path:
 from app.application.use_cases import task_test_seeder
 import load_recurrent_testset
 import load_simple_tasks_testset
-import mark_old_instances_stale
 
 
 DEFAULT_LIST_NAME = "my list"
@@ -41,8 +36,8 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Load the full test dataset for one Supabase user: simple tasks, "
-            "then recurrent tasks, then mark old instances as stale."
+            "Load the task dataset for one Supabase user: simple tasks first, "
+            "then recurrent/composite tasks."
         )
     )
     parser.add_argument(
@@ -101,30 +96,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--stale-days",
-        type=int,
-        default=mark_old_instances_stale.DEFAULT_STALE_DAYS,
-        help=(
-            "Move task instances to stale when due_date is older than this many "
-            f"days. Default: {mark_old_instances_stale.DEFAULT_STALE_DAYS}."
-        ),
-    )
-    parser.add_argument(
         "--recurrent-dry-run",
         action="store_true",
         help="Validate and print recurrent inserts without writing them.",
-    )
-    parser.add_argument(
-        "--stale-dry-run",
-        action="store_true",
-        help="Print stale candidates without updating their status.",
     )
 
     args = parser.parse_args()
     if args.rrule_instances is not None and args.rrule_instances < 1:
         parser.error("--rrule-instances must be at least 1.")
-    if args.stale_days < 1:
-        parser.error("--stale-days must be at least 1.")
     return args
 
 
@@ -199,30 +178,8 @@ def load_recurrent_stage(client, *, list_id: str, args: argparse.Namespace) -> d
     return result
 
 
-def load_stale_stage(client, *, args: argparse.Namespace) -> tuple[list[dict], int]:
-    """Run the stale-marking stage against very old instances."""
-
-    candidates = mark_old_instances_stale.get_stale_candidates(client, args.stale_days)
-    for row in candidates:
-        print(
-            f"- {row['title']} | instance={row['instance_id']} | "
-            f"status={row['status']} | due_date={row['due_date'].isoformat()}"
-        )
-
-    updated_count = mark_old_instances_stale.mark_instances_stale(
-        client,
-        candidates,
-        args.stale_dry_run,
-    )
-    if args.stale_dry_run:
-        print(f"Stale stage dry run complete: candidates={len(candidates)}.")
-    else:
-        print(f"Stale stage complete: moved_to_stale={updated_count}.")
-    return candidates, updated_count
-
-
 def main() -> None:
-    """Run the full three-stage test-data workflow."""
+    """Run the two-stage test-data loading workflow."""
 
     args = parse_args()
     client = load_simple_tasks_testset.build_client()
@@ -235,8 +192,6 @@ def main() -> None:
     print(f"Recurrent CSV: {args.recurrent_csv}")
     print(f"From scratch: {args.from_scratch}")
     print(f"Recurrent dry run: {args.recurrent_dry_run}")
-    print(f"Stale dry run: {args.stale_dry_run}")
-    print(f"Stale threshold (days): {args.stale_days}")
 
     print_stage_header(1, "Load simple task test set")
     load_simple_stage(client, list_id=target_list["id"], args=args)
@@ -244,11 +199,8 @@ def main() -> None:
     print_stage_header(2, "Load recurrent task test set")
     load_recurrent_stage(client, list_id=target_list["id"], args=args)
 
-    print_stage_header(3, "Mark old instances as stale")
-    load_stale_stage(client, args=args)
-
     print()
-    print("Full test-data workflow complete.")
+    print("Test-data loading workflow complete.")
 
 
 if __name__ == "__main__":

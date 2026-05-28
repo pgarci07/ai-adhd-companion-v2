@@ -10,7 +10,6 @@ import inspect
 import html
 import textwrap
 import re
-from math import ceil
 from pathlib import Path
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
@@ -32,13 +31,11 @@ import pytz # Recomendado para manejo de zonas horarias
 from st_aggrid import AgGrid, GridOptionsBuilder
 from app.config import (
     CHUNK_TIMER_DEFAULT_SECONDS,
-    CHUNK_PERSONA_STATE_MODIFIERS,
     DEFAULT_COMPLETED_TASK_LOOKBACK_DAYS,
     DEFAULT_CHUNK_MIN_FLOOR_MINUTES,
     DEFAULT_MAX_CONTINUOUS_WORK_MINUTES,
     DEFAULT_PLANNER_TIMEOUT_MINUTES,
     DEFAULT_REST_DURATION_MINUTES,
-    DEFAULT_SESSION_EXTENSION_TOLERANCE,
     EDIT_TASK_MAX_DATE,
     EDIT_TASK_MIN_DATE,
     GRID_ACTIVE_STATUSES,
@@ -48,9 +45,6 @@ from app.config import (
     OPENAI_LOG_PATH,
     OPENAI_MODEL,
     PLANNER_TIMER_SOURCE_LABEL,
-    POMODORO_REST_MINUTES,
-    POMODORO_SPRINT_TEST_MINUTES,
-    REST_MESSAGE_MODAL_SECONDS,
     STATE_TIME_RECENT_SESSIONS_LIMIT,
     SUPPORTED_LANGUAGES,
     SUPPORTED_TIME_MANAGEMENT_METHODS,
@@ -61,7 +55,7 @@ from app.config import (
     WORK_SESSION_STATE_REPROMPT_HOURS,
     WORK_TIMER_EXPIRY_STATE_NAME,
 )
-from app.ui import body_doubling, audio_support
+from app.ui import body_doubling, audio_support, chunk, pomodoro
 from app.ui.state.timers import (
     INACTIVITY_TIMER_KEY,
     PLANNER_TIMER_KEY,
@@ -186,19 +180,19 @@ NEW_TASK_RESET_PENDING_KEY = "new_task_reset_pending"
 # Session key used to defer task completion until optional feedback is collected.
 TASK_COMPLETION_FEEDBACK_REQUEST_KEY = "task_completion_feedback_request"
 # Session keys for focus overlays and active focus-cycle metadata.
-POMODORO_OVERLAY_STATE_KEY = "pomodoro_overlay_state"
-FOCUS_CYCLE_TRACKER_KEY = "focus_cycle_tracker"
-CHUNK_CONTINUOUS_WORK_SECONDS_KEY = "chunk_continuous_work_seconds"
+POMODORO_OVERLAY_STATE_KEY = pomodoro.POMODORO_OVERLAY_STATE_KEY
+FOCUS_CYCLE_TRACKER_KEY = pomodoro.FOCUS_CYCLE_TRACKER_KEY
+CHUNK_CONTINUOUS_WORK_SECONDS_KEY = chunk.CHUNK_CONTINUOUS_WORK_SECONDS_KEY
 OVERLAY_ACTION_QUERY_KEY = "_overlay_action"
-SPRINT_REVIEW_PENDING_KEY = "sprint_review_pending"
-CHUNK_REVIEW_PENDING_KEY = "chunk_review_pending"
-CHUNK_SESSION_EXTENSION_PROMPT_CONTEXT_KEY = "chunk_session_extension_prompt_context"
-REST_MESSAGE_KEY = "rest_message"
-REST_MESSAGE_EXPIRES_AT_KEY = "rest_message_expires_at"
-REST_RESUME_PROMPT_CONTEXT_KEY = "rest_resume_prompt_context"
-REST_RESUME_PROMPT_PENDING_KEY = "rest_resume_prompt_pending"
+SPRINT_REVIEW_PENDING_KEY = pomodoro.SPRINT_REVIEW_PENDING_KEY
+CHUNK_REVIEW_PENDING_KEY = chunk.CHUNK_REVIEW_PENDING_KEY
+CHUNK_SESSION_EXTENSION_PROMPT_CONTEXT_KEY = chunk.CHUNK_SESSION_EXTENSION_PROMPT_CONTEXT_KEY
+REST_MESSAGE_KEY = pomodoro.REST_MESSAGE_KEY
+REST_MESSAGE_EXPIRES_AT_KEY = pomodoro.REST_MESSAGE_EXPIRES_AT_KEY
+REST_RESUME_PROMPT_CONTEXT_KEY = pomodoro.REST_RESUME_PROMPT_CONTEXT_KEY
+REST_RESUME_PROMPT_PENDING_KEY = pomodoro.REST_RESUME_PROMPT_PENDING_KEY
 RESUMABLE_SESSION_ELAPSED_SECONDS_KEY = "resumable_session_elapsed_seconds"
-CHUNK_REMAINING_MINUTES_BY_INSTANCE_KEY = "chunk_remaining_minutes_by_instance"
+CHUNK_REMAINING_MINUTES_BY_INSTANCE_KEY = chunk.CHUNK_REMAINING_MINUTES_BY_INSTANCE_KEY
 # Session keys for persistent page notices and logout confirmation.
 ADAPTIVE_NOTICE_QUEUE_KEY = "adaptive_notice_message"
 TIMING_NOTICE_QUEUE_KEY = "timing_notice_message"
@@ -246,8 +240,7 @@ if "session_expected_work_time" not in st.session_state:
     st.session_state["session_expected_work_time"] = None
 if RESUMABLE_SESSION_ELAPSED_SECONDS_KEY not in st.session_state:
     st.session_state[RESUMABLE_SESSION_ELAPSED_SECONDS_KEY] = 0
-if CHUNK_REMAINING_MINUTES_BY_INSTANCE_KEY not in st.session_state:
-    st.session_state[CHUNK_REMAINING_MINUTES_BY_INSTANCE_KEY] = {}
+chunk.ensure_chunk_session_state()
 if "current_page" not in st.session_state:
     st.session_state["current_page"] = "tasks"
 if "tasks_grid_version" not in st.session_state:
@@ -744,6 +737,37 @@ def get_guided_auto_open_adaptation(tasks_df):
     if not adaptation or not adaptation.auto_open_first_task:
         return None, None
     return adaptation, context
+
+
+def get_current_guided_active_grid(tasks_df, adaptation):
+    """Rebuild the currently active grid for guided-open continuation checks."""
+
+    current_page = st.session_state.get("current_page")
+    if current_page == "task_search":
+        return build_task_search_active_grid(tasks_df, adaptation)
+    return build_my_tasks_active_grid(tasks_df, adaptation)
+
+
+def guided_chain_has_next_candidate() -> bool:
+    """Return whether the current guided chain still has another proposal."""
+
+    if not st.session_state.get(GUIDED_AUTO_OPEN_CHAIN_ACTIVE_KEY):
+        return False
+
+    tasks_df = get_tasks_dataframe()
+    if tasks_df.empty:
+        return False
+
+    adaptation, _ = get_guided_auto_open_adaptation(tasks_df)
+    if not adaptation:
+        return False
+
+    current_active_grid = get_current_guided_active_grid(tasks_df, adaptation)
+    next_candidate = active_task_grid.get_next_open_candidate(
+        current_active_grid,
+        offered_instance_ids=get_adaptive_offered_instance_ids(),
+    )
+    return next_candidate is not None
 
 
 def queue_guided_open_for_state(state_name):
@@ -1877,145 +1901,67 @@ def notify_work_ended():
 def get_pomodoro_overlay_state():
     """Read the current focus-overlay payload from session state."""
 
-    return st.session_state.get(POMODORO_OVERLAY_STATE_KEY)
+    return pomodoro.get_pomodoro_overlay_state()
 
 
 def clear_pomodoro_overlay_state():
     """Remove the active focus overlay from session state."""
 
-    st.session_state.pop(POMODORO_OVERLAY_STATE_KEY, None)
+    pomodoro.clear_pomodoro_overlay_state()
 
 
 def get_focus_cycle_tracker():
     """Return the current per-task focus-cycle tracker."""
 
-    return st.session_state.get(FOCUS_CYCLE_TRACKER_KEY, {})
+    return pomodoro.get_focus_cycle_tracker()
 
 
 def start_focus_cycle_tracker(task_row, cycle_type):
     """Start or increment the focus-cycle counter for one task and cycle type."""
 
-    tracker = get_focus_cycle_tracker()
-    previous_instance_id = tracker.get("instance_id")
-    previous_cycle_type = tracker.get("cycle_type")
-    previous_iterations = int(tracker.get("iterations", 0) or 0)
-    iterations = (
-        previous_iterations + 1
-        if previous_instance_id == task_row.get("instance_id") and previous_cycle_type == cycle_type
-        else 1
-    )
-    new_tracker = {
-        "instance_id": task_row.get("instance_id"),
-        "task_id": task_row.get("task_id"),
-        "cycle_type": cycle_type,
-        "iterations": iterations,
-    }
-    st.session_state[FOCUS_CYCLE_TRACKER_KEY] = new_tracker
-    return new_tracker
+    return pomodoro.start_focus_cycle_tracker(task_row, cycle_type)
 
 
 def clear_focus_cycle_tracker():
     """Clear the active focus-cycle tracker."""
 
-    st.session_state.pop(FOCUS_CYCLE_TRACKER_KEY, None)
+    pomodoro.clear_focus_cycle_tracker()
 
 
 def format_cycle_minutes_label(duration_seconds):
     """Format a duration in seconds as a compact minute label."""
 
-    minutes = round(float(duration_seconds or 0) / 60.0, 1)
-    if minutes.is_integer():
-        return str(int(minutes))
-    return str(minutes)
+    return pomodoro.format_cycle_minutes_label(duration_seconds)
 
 
 def get_pomodoro_overlay_opacity():
     """Choose the overlay opacity, allowing adaptive rules to override it."""
 
-    adaptation, _ = get_current_task_adaptation(get_tasks_dataframe())
-    if adaptation and adaptation.opaque_guided_pomodoro_overlay:
-        return 0.96
-    return 0.76
+    return pomodoro.get_pomodoro_overlay_opacity(get_pomodoro_services())
 
 
 def start_pomodoro_overlay(task_row, duration_minutes):
     """Create the Pomodoro focus overlay state for the opened task."""
 
-    tracker = start_focus_cycle_tracker(task_row, "pomodoro")
-    iterations = int(tracker.get("iterations", 1) or 1)
-    enriched_task_row = (
-        get_enriched_task_row_by_instance_id(task_row.get("instance_id"))
-        if task_row and task_row.get("instance_id")
-        else None
-    )
-    task_duration_minutes = (
-        (enriched_task_row or {}).get("size_minutes")
-        if enriched_task_row
-        else task_row.get("size_minutes")
-    )
-    st.session_state[POMODORO_OVERLAY_STATE_KEY] = {
-        "instance_id": task_row.get("instance_id"),
-        "task_id": task_row.get("task_id"),
-        "title": task_row.get("title"),
-        "description": task_row.get("description"),
-        "task_duration_minutes": task_duration_minutes,
-        "duration_minutes": int(duration_minutes),
-        "duration_seconds": int(duration_minutes) * 60,
-        "work_duration_minutes": int(duration_minutes),
-        "iterations": iterations,
-        "started_at": datetime.now(pytz.UTC).timestamp(),
-        "mode": "work",
-        "cycle_type": "pomodoro",
-    }
+    pomodoro.start_pomodoro_overlay(task_row, duration_minutes, get_pomodoro_services())
 
 
 def start_pomodoro_rest_overlay(duration_minutes):
     """Switch the active overlay into Pomodoro rest mode."""
 
-    previous_state = get_pomodoro_overlay_state() or {}
-    st.session_state[POMODORO_OVERLAY_STATE_KEY] = {
-        **previous_state,
-        "duration_minutes": int(duration_minutes),
-        "duration_seconds": int(duration_minutes) * 60,
-        "started_at": datetime.now(pytz.UTC).timestamp(),
-        "mode": "rest",
-        "cycle_type": "pomodoro",
-    }
+    pomodoro.start_pomodoro_rest_overlay(duration_minutes)
 
 
 def start_chunk_overlay(task_row, duration_seconds):
-    tracker = start_focus_cycle_tracker(task_row, "chunk")
-    iterations = int(tracker.get("iterations", 1) or 1)
-    enriched_task_row = (
-        get_enriched_task_row_by_instance_id(task_row.get("instance_id"))
-        if task_row and task_row.get("instance_id")
-        else None
-    )
-    task_duration_minutes = (
-        (enriched_task_row or {}).get("size_minutes")
-        if enriched_task_row
-        else task_row.get("size_minutes")
-    )
-    st.session_state[POMODORO_OVERLAY_STATE_KEY] = {
-        "instance_id": task_row.get("instance_id"),
-        "task_id": task_row.get("task_id"),
-        "title": task_row.get("title"),
-        "description": task_row.get("description"),
-        "task_duration_minutes": task_duration_minutes,
-        "duration_seconds": int(duration_seconds),
-        "duration_minutes_label": format_cycle_minutes_label(duration_seconds),
-        "iterations": iterations,
-        "started_at": datetime.now(pytz.UTC).timestamp(),
-        "mode": "work",
-        "cycle_type": "chunk",
-    }
+    """Compatibility wrapper for the extracted Chunk flow module."""
+
+    chunk.start_chunk_overlay(task_row, duration_seconds, get_chunk_services())
 
 
 def get_next_chunk_work_seconds(task_row=None):
     """Return the next Chunk work-block duration in seconds."""
 
-    chunk_plan = calculate_next_chunk_plan(task_row)
-    return max(60, int(round(float(chunk_plan["duration_minutes"]) * 60)))
+    return chunk.get_next_chunk_work_seconds(task_row, get_chunk_services())
 
 
 def calculate_next_chunk_plan(task_row=None):
@@ -2028,86 +1974,19 @@ def calculate_next_chunk_plan(task_row=None):
     extend the expected session time.
     """
 
-    resolved_task_row = task_row or get_open_task_row()
-    size_minutes = float(get_chunk_remaining_minutes(resolved_task_row))
-    elapsed_session_minutes = float(get_resumable_session_elapsed_minutes())
-    expected_session_minutes = max(1.0, float(get_effective_session_work_time()))
-    remaining_continuous_minutes = float(get_time_to_max_continuous_work_minutes())
-    chunk_floor_minutes = float(get_chunk_min_floor_minutes())
-    session_tolerance = get_chunk_session_extension_tolerance()
-
-    stamina_factor = max(
-        0.0,
-        1.0 - (elapsed_session_minutes / expected_session_minutes),
-    )
-    work_base = size_minutes * stamina_factor
-
-    persona_name = task_adaptation.PERSONA_NAME_ALIASES.get(
-        str(get_current_persona_name() or "").strip().lower(),
-        str(get_current_persona_name() or "").strip().lower(),
-    )
-    state_name = task_adaptation.STATE_NAME_ALIASES.get(
-        str(get_effective_current_state_name() or "").strip().lower(),
-        str(get_effective_current_state_name() or "").strip().lower(),
-    )
-    modifier = (
-        CHUNK_PERSONA_STATE_MODIFIERS.get(persona_name, {}).get(state_name)
-        if persona_name and state_name
-        else None
-    )
-    if modifier is None:
-        modifier = 1.0
-
-    work_target = work_base * float(modifier)
-    hard_cap_minutes = max(1.0, remaining_continuous_minutes)
-    suggested_minutes = min(work_target, hard_cap_minutes)
-
-    if suggested_minutes >= chunk_floor_minutes:
-        return {
-            "status": "ok",
-            "duration_minutes": max(1, int(round(suggested_minutes))),
-        }
-
-    floor_candidate_minutes = min(chunk_floor_minutes, hard_cap_minutes)
-    soft_session_limit = expected_session_minutes * (1.0 + session_tolerance)
-    remaining_soft_session_minutes = max(
-        0.0,
-        soft_session_limit - elapsed_session_minutes,
-    )
-
-    if floor_candidate_minutes <= remaining_soft_session_minutes:
-        return {
-            "status": "ok",
-            "duration_minutes": max(1, int(round(floor_candidate_minutes))),
-        }
-
-    suggested_extension_minutes = max(
-        1,
-        int(ceil(floor_candidate_minutes - remaining_soft_session_minutes)),
-    )
-    return {
-        "status": "needs_session_extension",
-        "duration_minutes": max(1, int(round(max(suggested_minutes, 1.0)))),
-        "suggested_floor_minutes": max(1, int(round(floor_candidate_minutes))),
-        "remaining_soft_session_minutes": max(0, int(round(remaining_soft_session_minutes))),
-        "suggested_extension_minutes": suggested_extension_minutes,
-        "task_row": dict(resolved_task_row or {}),
-    }
+    return chunk.calculate_next_chunk_plan(task_row, get_chunk_services())
 
 
 def clear_chunk_session_extension_prompt():
     """Clear any pending Chunk session-extension confirmation dialog."""
 
-    st.session_state.pop(CHUNK_SESSION_EXTENSION_PROMPT_CONTEXT_KEY, None)
+    chunk.clear_chunk_session_extension_prompt()
 
 
 def queue_chunk_session_extension_prompt(chunk_plan, *, source_label):
     """Persist a pending Chunk extension prompt until the dialog consumes it."""
 
-    st.session_state[CHUNK_SESSION_EXTENSION_PROMPT_CONTEXT_KEY] = {
-        **dict(chunk_plan or {}),
-        "source_label": source_label,
-    }
+    chunk.queue_chunk_session_extension_prompt(chunk_plan, source_label=source_label)
 
 
 def request_next_chunk_cycle(task_row=None, *, source_label):
@@ -2118,25 +1997,11 @@ def request_next_chunk_cycle(task_row=None, *, source_label):
     and the same extension-confirmation behaviour.
     """
 
-    resolved_task_row = task_row or get_open_task_row()
-    if not resolved_task_row:
-        return False
-
-    clear_chunk_session_extension_prompt()
-    chunk_plan = calculate_next_chunk_plan(resolved_task_row)
-    if chunk_plan["status"] == "needs_session_extension":
-        queue_chunk_session_extension_prompt(chunk_plan, source_label=source_label)
-        return False
-
-    duration_minutes = float(chunk_plan["duration_minutes"])
-    duration_seconds = int(duration_minutes * 60)
-    schedule_work_timer(
-        duration_minutes,
-        eoChunk,
-        source_label,
+    return chunk.request_next_chunk_cycle(
+        task_row,
+        source_label=source_label,
+        services=get_chunk_services(),
     )
-    start_chunk_overlay(resolved_task_row, duration_seconds)
-    return True
 
 
 def get_effective_pomodoro_sprint_minutes():
@@ -2148,23 +2013,13 @@ def get_effective_pomodoro_sprint_minutes():
     available.
     """
 
-    return int(
-        get_user_preferences().get(
-            "sprint",
-            POMODORO_SPRINT_TEST_MINUTES,
-        )
-    )
+    return pomodoro.get_effective_pomodoro_sprint_minutes(get_pomodoro_services())
 
 
 def get_max_continuous_work_minutes():
     """Return the session-level cap before Chunk mode forces a rest break."""
 
-    return int(
-        get_user_preferences().get(
-            "max_continuous_work_minutes",
-            DEFAULT_MAX_CONTINUOUS_WORK_MINUTES,
-        )
-    )
+    return chunk.get_max_continuous_work_minutes(get_chunk_services())
 
 
 def get_effective_rest_duration_minutes():
@@ -2175,23 +2030,13 @@ def get_effective_rest_duration_minutes():
     single preference keeps those recovery moments consistent.
     """
 
-    return int(
-        get_user_preferences().get(
-            "rest_duration",
-            DEFAULT_REST_DURATION_MINUTES,
-        )
-    )
+    return pomodoro.get_effective_rest_duration_minutes(get_pomodoro_services())
 
 
 def get_chunk_min_floor_minutes():
     """Return the preferred minimum useful size for one Chunk work block."""
 
-    return int(
-        get_user_preferences().get(
-            "chunk_min_floor_minutes",
-            DEFAULT_CHUNK_MIN_FLOOR_MINUTES,
-        )
-    )
+    return chunk.get_chunk_min_floor_minutes(get_chunk_services())
 
 
 def get_chunk_session_extension_tolerance():
@@ -2202,28 +2047,25 @@ def get_chunk_session_extension_tolerance():
     to extend the session explicitly.
     """
 
-    return float(DEFAULT_SESSION_EXTENSION_TOLERANCE)
+    return chunk.get_chunk_session_extension_tolerance()
 
 
 def get_chunk_continuous_work_seconds():
     """Return accumulated Chunk work seconds for the current authenticated session."""
 
-    return int(st.session_state.get(CHUNK_CONTINUOUS_WORK_SECONDS_KEY, 0) or 0)
+    return chunk.get_chunk_continuous_work_seconds()
 
 
 def add_chunk_continuous_work_seconds(additional_seconds):
     """Accumulate elapsed Chunk work across tasks until a forced rest resets it."""
 
-    additional_seconds = max(0, int(additional_seconds or 0))
-    st.session_state[CHUNK_CONTINUOUS_WORK_SECONDS_KEY] = (
-        get_chunk_continuous_work_seconds() + additional_seconds
-    )
+    chunk.add_chunk_continuous_work_seconds(additional_seconds)
 
 
 def reset_chunk_continuous_work_seconds():
     """Clear the Chunk continuous-work accumulator after a forced rest starts."""
 
-    st.session_state[CHUNK_CONTINUOUS_WORK_SECONDS_KEY] = 0
+    chunk.reset_chunk_continuous_work_seconds()
 
 
 def get_chunk_remaining_minutes(task_row):
@@ -2234,76 +2076,19 @@ def get_chunk_remaining_minutes(task_row):
     cycle uses the remaining effort instead of the original estimate.
     """
 
-    if not task_row:
-        return CHUNK_TIMER_DEFAULT_SECONDS / 60.0
-
-    resolved_task_row = (
-        get_enriched_task_row_by_instance_id(task_row.get("instance_id"))
-        or task_row
-    )
-    size_minutes = resolved_task_row.get("size_minutes")
-    if pd.isna(size_minutes) if size_minutes is not None else True:
-        custom_sizes = get_user_preferences().get("custom_sizes", [15, 30, 60, 180, 720])
-        size_id = resolved_task_row.get("size_id")
-        if size_id and 0 < int(size_id) <= len(custom_sizes):
-            size_minutes = int(custom_sizes[int(size_id) - 1])
-        else:
-            size_minutes = CHUNK_TIMER_DEFAULT_SECONDS / 60.0
-
-    remaining_by_instance = dict(st.session_state.get(CHUNK_REMAINING_MINUTES_BY_INSTANCE_KEY) or {})
-    instance_id = resolved_task_row.get("instance_id")
-    if not instance_id:
-        return float(size_minutes)
-
-    if instance_id not in remaining_by_instance:
-        remaining_by_instance[instance_id] = float(size_minutes)
-        st.session_state[CHUNK_REMAINING_MINUTES_BY_INSTANCE_KEY] = remaining_by_instance
-        return float(size_minutes)
-
-    remaining_minutes = float(remaining_by_instance.get(instance_id) or 0.0)
-    if remaining_minutes <= 0:
-        # If the user asks for another Chunk cycle after exhausting the
-        # original estimate, treat that as an under-estimated task and fall
-        # back to half of the original task size.
-        return max(1.0, float(size_minutes) / 2.0)
-
-    return remaining_minutes
+    return chunk.get_chunk_remaining_minutes(task_row, get_chunk_services())
 
 
 def register_chunk_work_elapsed(task_row, elapsed_seconds):
     """Subtract real worked time from the remaining Chunk size of one instance."""
 
-    if not task_row:
-        return
-
-    resolved_task_row = (
-        get_enriched_task_row_by_instance_id(task_row.get("instance_id"))
-        or task_row
-    )
-    instance_id = resolved_task_row.get("instance_id")
-    if not instance_id:
-        return
-
-    remaining_by_instance = dict(st.session_state.get(CHUNK_REMAINING_MINUTES_BY_INSTANCE_KEY) or {})
-    remaining_minutes = get_chunk_remaining_minutes(resolved_task_row)
-    worked_minutes = max(0.0, float(elapsed_seconds or 0) / 60.0)
-    remaining_by_instance[instance_id] = max(0.0, remaining_minutes - worked_minutes)
-    st.session_state[CHUNK_REMAINING_MINUTES_BY_INSTANCE_KEY] = remaining_by_instance
+    chunk.register_chunk_work_elapsed(task_row, elapsed_seconds, get_chunk_services())
 
 
 def clear_chunk_remaining_minutes(task_row):
     """Forget Chunk remaining-size state for one instance when it is no longer useful."""
 
-    if not task_row:
-        return
-
-    instance_id = task_row.get("instance_id")
-    if not instance_id:
-        return
-
-    remaining_by_instance = dict(st.session_state.get(CHUNK_REMAINING_MINUTES_BY_INSTANCE_KEY) or {})
-    remaining_by_instance.pop(instance_id, None)
-    st.session_state[CHUNK_REMAINING_MINUTES_BY_INSTANCE_KEY] = remaining_by_instance
+    chunk.clear_chunk_remaining_minutes(task_row)
 
 
 def get_query_param_value(param_name):
@@ -2355,6 +2140,8 @@ def handle_overlay_action_query_params():
 
 
 def render_pomodoro_overlay():
+    return pomodoro.render_pomodoro_overlay(get_pomodoro_services())
+
     overlay_state = get_pomodoro_overlay_state()
     if not overlay_state or overlay_state.get("mode") not in {"work", "rest"}:
         return
@@ -2707,22 +2494,7 @@ def render_pomodoro_overlay():
 def should_render_pomodoro_session_only():
     """Return whether the authenticated app should be replaced by the focus overlay."""
 
-    overlay_state = get_pomodoro_overlay_state()
-    if not overlay_state or overlay_state.get("mode") not in {"work", "rest"}:
-        return False
-    if body_doubling.should_render_body_doubling_session_only():
-        return False
-    if st.session_state.get(OPEN_TASK_GUIDANCE_EXPIRES_AT_KEY) is not None:
-        return False
-    if st.session_state.get(SPRINT_REVIEW_PENDING_KEY):
-        return False
-    if st.session_state.get(REST_RESUME_PROMPT_PENDING_KEY):
-        return False
-    if st.session_state.get(REST_MESSAGE_EXPIRES_AT_KEY) is not None:
-        return False
-
-    timer_snapshot = get_work_timer_snapshot()
-    return bool(timer_snapshot.running and timer_snapshot.expires_at is not None)
+    return pomodoro.should_render_pomodoro_session_only(get_pomodoro_services())
 
 
 def should_render_pomodoro_session_with_guidance_only():
@@ -2735,20 +2507,19 @@ def should_render_pomodoro_session_with_guidance_only():
     mode for that temporary guidance window.
     """
 
-    overlay_state = get_pomodoro_overlay_state()
-    if not overlay_state or overlay_state.get("mode") not in {"work", "rest"}:
-        return False
-    if body_doubling.should_render_body_doubling_session_only():
-        return False
-    if st.session_state.get(OPEN_TASK_GUIDANCE_EXPIRES_AT_KEY) is None:
-        return False
-
-    timer_snapshot = get_work_timer_snapshot()
-    return bool(timer_snapshot.running and timer_snapshot.expires_at is not None)
+    return pomodoro.should_render_pomodoro_session_with_guidance_only(
+        get_pomodoro_services()
+    )
 
 
 def render_pomodoro_session_controls():
     """Render the stop/interrupt control used by rest and chunk overlays."""
+
+    return pomodoro.render_pomodoro_session_controls(
+        get_pomodoro_services(),
+        expire_sprint_callback=eoSprint,
+        expire_chunk_callback=eoChunk,
+    )
 
     overlay_state = get_pomodoro_overlay_state() or {}
     if not overlay_state:
@@ -3054,7 +2825,7 @@ def task_completion_feedback_dialog():
         height=120,
     )
 
-    submit_column, skip_column = st.columns(2, gap="small")
+    submit_column, skip_column, cancel_column = st.columns(3, gap="small")
     with submit_column:
         submit_clicked = st.button(
             "Save feedback and complete",
@@ -3068,6 +2839,17 @@ def task_completion_feedback_dialog():
             use_container_width=True,
             key=f"completion_feedback_skip_{task_row.get('instance_id')}",
         )
+    with cancel_column:
+        cancel_clicked = st.button(
+            "Cancel",
+            use_container_width=True,
+            key=f"completion_feedback_cancel_{task_row.get('instance_id')}",
+        )
+
+    if cancel_clicked:
+        clear_task_completion_feedback_request()
+        st.rerun()
+        return
 
     if not submit_clicked and not skip_clicked:
         return
@@ -3467,6 +3249,13 @@ def apply_user_state_transition_result(result):
         if result and result.context
         else None
     )
+    should_preserve_guided_chain = False
+    if (
+        result.changed
+        and result.current_state == user_state_machine.PLANNER_STATE
+        and last_event == user_state_machine.WORK_ENDED_EVENT
+    ):
+        should_preserve_guided_chain = guided_chain_has_next_candidate()
 
     if result.changed and result.current_state == user_state_machine.RECOVERY_STATE:
         # Guided chains should never survive session closure or timeout
@@ -3475,7 +3264,7 @@ def apply_user_state_transition_result(result):
         st.session_state.pop(GUIDED_OPEN_REQUEST_PENDING_KEY, None)
         st.session_state.pop(LOGIN_AUTO_OPEN_STATE_KEY, None)
     elif result.changed and result.current_state == user_state_machine.PLANNER_STATE:
-        if last_event == user_state_machine.WORK_ENDED_EVENT:
+        if should_preserve_guided_chain:
             # Returning to Planner after an accepted work cycle is exactly the
             # point where a guided auto-open chain may continue with the next
             # candidate, so we intentionally preserve the chain flag here.
@@ -3506,7 +3295,12 @@ def apply_user_state_transition_result(result):
         st.session_state.pop(GUIDED_OPEN_REQUEST_PENDING_KEY, None)
         st.session_state.pop(LOGIN_AUTO_OPEN_STATE_KEY, None)
 
-    if result.changed and result.context and result.context.last_event != user_state_machine.TASK_OPENED_EVENT:
+    if (
+        result.changed
+        and result.context
+        and result.context.last_event != user_state_machine.TASK_OPENED_EVENT
+        and not should_preserve_guided_chain
+    ):
         # Offered-task chains only make sense within the current adaptive state.
         # Opening a suggested task can intentionally leave Planner, but it should
         # not make that same unfinished task eligible again on the next rerun.
@@ -3737,15 +3531,11 @@ def disable_work_timer():
 
 
 def set_rest_message(message):
-    st.session_state[REST_MESSAGE_KEY] = message
-    st.session_state[REST_MESSAGE_EXPIRES_AT_KEY] = (
-        datetime.now(pytz.UTC).timestamp() + REST_MESSAGE_MODAL_SECONDS
-    )
+    pomodoro.set_rest_message(message)
 
 
 def clear_rest_message():
-    st.session_state.pop(REST_MESSAGE_KEY, None)
-    st.session_state.pop(REST_MESSAGE_EXPIRES_AT_KEY, None)
+    pomodoro.clear_rest_message()
 
 
 def set_rest_resume_prompt_context(
@@ -3762,35 +3552,27 @@ def set_rest_resume_prompt_context(
     incomplete.
     """
 
-    st.session_state[REST_RESUME_PROMPT_CONTEXT_KEY] = {
-        "previous_work_outcome": previous_work_outcome,
-        "work_duration_minutes": int(work_duration_minutes),
-        "resume_cycle_type": resume_cycle_type,
-    }
-    st.session_state[REST_RESUME_PROMPT_PENDING_KEY] = False
+    pomodoro.set_rest_resume_prompt_context(
+        previous_work_outcome=previous_work_outcome,
+        work_duration_minutes=work_duration_minutes,
+        resume_cycle_type=resume_cycle_type,
+    )
 
 
 def get_rest_resume_prompt_context():
     """Return the stored post-rest decision context, if any."""
 
-    return st.session_state.get(REST_RESUME_PROMPT_CONTEXT_KEY)
+    return pomodoro.get_rest_resume_prompt_context()
 
 
 def clear_rest_resume_prompt_context():
     """Forget any pending post-rest resume/finish decision."""
 
-    st.session_state.pop(REST_RESUME_PROMPT_CONTEXT_KEY, None)
-    st.session_state.pop(REST_RESUME_PROMPT_PENDING_KEY, None)
+    pomodoro.clear_rest_resume_prompt_context()
 
 
 def clear_expired_rest_message():
-    expires_at = st.session_state.get(REST_MESSAGE_EXPIRES_AT_KEY)
-    if expires_at is None:
-        return
-
-    if datetime.now(pytz.UTC).timestamp() >= float(expires_at):
-        clear_rest_message()
-        st.rerun()
+    pomodoro.clear_expired_rest_message(get_pomodoro_services())
 
 
 def begin_pomodoro_rest_break(
@@ -3805,21 +3587,11 @@ def begin_pomodoro_rest_break(
     than blindly reusing the previous duration.
     """
 
-    work_duration_minutes = get_effective_pomodoro_sprint_minutes()
-    set_rest_resume_prompt_context(
+    pomodoro.begin_pomodoro_rest_break(
         previous_work_outcome=previous_work_outcome,
-        work_duration_minutes=work_duration_minutes,
         resume_cycle_type=resume_cycle_type,
+        services=get_pomodoro_services(),
     )
-    rest_duration_minutes = get_effective_rest_duration_minutes()
-    append_timer_log_line(
-        f"request_reset | timer=work_timer source=sprint_review_rest duration_minutes={rest_duration_minutes} callback=eoRest"
-    )
-    get_work_timer(st.session_state).reset(
-        duration=rest_duration_minutes * 60,
-        on_expiry=eoRest,
-    )
-    start_pomodoro_rest_overlay(rest_duration_minutes)
 
 
 def finalize_post_rest_finish(prompt_context):
@@ -3832,74 +3604,19 @@ def finalize_post_rest_finish(prompt_context):
     already overdue, in which case it transitions to ``debt`` immediately.
     """
 
-    previous_work_outcome = (prompt_context or {}).get("previous_work_outcome")
-    resume_cycle_type = (prompt_context or {}).get("resume_cycle_type")
-    disable_work_timer()
-    clear_pomodoro_overlay_state()
-    clear_rest_resume_prompt_context()
-    clear_rest_message()
-    if previous_work_outcome == "incomplete":
-        open_task = get_open_task_row()
-        if open_task:
-            next_status = get_post_work_incomplete_task_status(open_task)
-            if next_status != "open":
-                update_task_status(open_task, next_status)
-    notify_work_ended()
+    pomodoro.finalize_post_rest_finish(prompt_context, get_pomodoro_services())
 
 
 def eoSprint(timer=None):
-    clear_pomodoro_overlay_state()
-    st.session_state[SPRINT_REVIEW_PENDING_KEY] = True
-    disable_work_timer()
-    st.rerun()
+    pomodoro.expire_sprint(timer, services=get_pomodoro_services())
 
 
 def eoChunk(timer=None):
-    overlay_state = get_pomodoro_overlay_state() or {}
-    timer_snapshot = get_work_timer_snapshot()
-    total_seconds = int(
-        timer_snapshot.duration_seconds
-        or overlay_state.get("duration_seconds")
-        or get_next_chunk_work_seconds()
-    )
-    remaining_seconds = 0
-    if timer_snapshot.running and timer_snapshot.expires_at is not None:
-        remaining_seconds = max(
-            0,
-            int(timer_snapshot.expires_at - datetime.now(pytz.UTC).timestamp()),
-        )
-    elapsed_seconds = max(0, total_seconds - remaining_seconds)
-    add_chunk_continuous_work_seconds(elapsed_seconds or total_seconds)
-    register_chunk_work_elapsed(
-        overlay_state.get("task_row") or get_open_task_row(),
-        elapsed_seconds or total_seconds,
-    )
-    clear_pomodoro_overlay_state()
-    disable_work_timer()
-    st.session_state[CHUNK_REVIEW_PENDING_KEY] = True
-    st.rerun()
+    chunk.expire_chunk_cycle(timer, services=get_chunk_services())
 
 
 def eoRest(timer=None):
-    open_task = get_open_task_row()
-    if not open_task:
-        clear_pomodoro_overlay_state()
-        disable_work_timer()
-        clear_rest_resume_prompt_context()
-        st.info("Rest is over.")
-        return
-
-    if not get_rest_resume_prompt_context():
-        clear_pomodoro_overlay_state()
-        disable_work_timer()
-        set_rest_message("Rest is over.")
-        st.rerun()
-        return
-
-    clear_pomodoro_overlay_state()
-    disable_work_timer()
-    st.session_state[REST_RESUME_PROMPT_PENDING_KEY] = True
-    st.rerun()
+    pomodoro.expire_rest(timer, services=get_pomodoro_services())
 
 
 def reset_work_timer_for_open_task(use_pomodoro_sprints):
@@ -3929,14 +3646,13 @@ def reset_work_timer_for_open_task(use_pomodoro_sprints):
 def clear_sprint_review_state():
     """Clear pending sprint-review dialog state."""
 
-    st.session_state.pop(SPRINT_REVIEW_PENDING_KEY, None)
-    st.session_state.pop("adaptive_rest_skip_confirmed", None)
+    pomodoro.clear_sprint_review_state()
 
 
 def clear_chunk_review_state():
     """Clear pending chunk-review dialog state."""
 
-    st.session_state.pop(CHUNK_REVIEW_PENDING_KEY, None)
+    chunk.clear_chunk_review_state()
 
 
 def set_open_task_guidance_message(message):
@@ -4494,6 +4210,79 @@ def render_pending_engaged_cheer():
         unsafe_allow_html=True,
     )
     st.session_state[ENGAGED_CHEER_RENDERED_TOKEN_KEY] = pending_token
+
+
+def set_focus_overlay_state(overlay_state):
+    """Persist focus-overlay state for extracted focus-flow modules."""
+
+    pomodoro.set_pomodoro_overlay_state(overlay_state)
+
+
+def get_pomodoro_services():
+    """Build the dependency bundle used by the extracted Pomodoro flow module."""
+
+    return pomodoro.PomodoroServices(
+        get_user_preferences=get_user_preferences,
+        get_enriched_task_row_by_instance_id=get_enriched_task_row_by_instance_id,
+        get_current_task_adaptation=get_current_task_adaptation,
+        get_tasks_dataframe=get_tasks_dataframe,
+        get_work_timer_snapshot=get_work_timer_snapshot,
+        get_work_timer=get_work_timer,
+        schedule_work_timer=schedule_work_timer,
+        disable_work_timer=disable_work_timer,
+        append_timer_log_line=append_timer_log_line,
+        expire_sprint_callback=eoSprint,
+        expire_rest_callback=eoRest,
+        get_open_task_row=get_open_task_row,
+        get_post_work_incomplete_task_status=get_post_work_incomplete_task_status,
+        update_task_status=update_task_status,
+        notify_work_ended=notify_work_ended,
+        request_task_completion_feedback=request_task_completion_feedback,
+        clear_task_completion_feedback_request=clear_task_completion_feedback_request,
+        display_message=display_message,
+        get_adaptive_message_intensity=get_adaptive_message_intensity,
+        render_voice_message_button=render_voice_message_button,
+        request_next_chunk_cycle=request_next_chunk_cycle,
+        body_doubling_session_active=body_doubling.should_render_body_doubling_session_only,
+        get_open_task_guidance_expires_at=lambda: st.session_state.get(
+            OPEN_TASK_GUIDANCE_EXPIRES_AT_KEY
+        ),
+        handle_api_exception=handle_api_exception,
+        rerun=st.rerun,
+        info=st.info,
+    )
+
+
+def get_chunk_services():
+    """Build the dependency bundle used by the extracted Chunk flow module."""
+
+    return chunk.ChunkServices(
+        get_user_preferences=get_user_preferences,
+        get_enriched_task_row_by_instance_id=get_enriched_task_row_by_instance_id,
+        get_open_task_row=get_open_task_row,
+        get_resumable_session_elapsed_minutes=get_resumable_session_elapsed_minutes,
+        get_effective_session_work_time=get_effective_session_work_time,
+        get_current_persona_name=get_current_persona_name,
+        get_effective_current_state_name=get_effective_current_state_name,
+        start_focus_cycle_tracker=start_focus_cycle_tracker,
+        set_focus_overlay_state=set_focus_overlay_state,
+        get_focus_overlay_state=get_pomodoro_overlay_state,
+        clear_focus_overlay_state=clear_pomodoro_overlay_state,
+        format_cycle_minutes_label=format_cycle_minutes_label,
+        schedule_work_timer=schedule_work_timer,
+        disable_work_timer=disable_work_timer,
+        get_work_timer_snapshot=get_work_timer_snapshot,
+        expire_chunk_cycle=eoChunk,
+        get_current_task_adaptation=get_current_task_adaptation,
+        get_tasks_dataframe=get_tasks_dataframe,
+        begin_rest_break=begin_pomodoro_rest_break,
+        clear_task_completion_feedback_request=clear_task_completion_feedback_request,
+        request_task_completion_feedback=request_task_completion_feedback,
+        get_post_work_incomplete_task_status=get_post_work_incomplete_task_status,
+        update_task_status=update_task_status,
+        notify_work_ended=notify_work_ended,
+        handle_api_exception=handle_api_exception,
+    )
 
 
 def get_body_doubling_services():
@@ -5086,9 +4875,7 @@ def get_resumable_session_elapsed_minutes():
 def get_time_to_max_continuous_work_minutes():
     """Return remaining minutes before Chunk mode must force a rest break."""
 
-    max_continuous_minutes = get_max_continuous_work_minutes()
-    elapsed_chunk_minutes = get_chunk_continuous_work_seconds() / 60.0
-    return max(0.0, float(max_continuous_minutes) - float(elapsed_chunk_minutes))
+    return chunk.get_time_to_max_continuous_work_minutes(get_chunk_services())
 
 
 def get_first_day_of_week():
@@ -7309,30 +7096,6 @@ def open_task_dialog(task_row):
         if task_row.get("instance_id") not in top_twenty_instance_ids:
             st.warning("This task is outside the top 20% of the current priority ranking.")
 
-    # When the adaptive matrix is silent, default to plain focused work.
-    # That means both toggles should land on "No" instead of implicitly opting
-    # the user into Pomodoro or Body-Doubling.
-    default_pomodoro_index = 1
-    default_body_doubling_index = 1
-    if current_adaptation and current_adaptation.default_pomodoro is not None:
-        default_pomodoro_index = 0 if current_adaptation.default_pomodoro else 1
-    if current_adaptation and current_adaptation.default_body_doubling is not None:
-        default_body_doubling_index = 0 if current_adaptation.default_body_doubling else 1
-
-    pomodoro_choice = st.selectbox(
-        "Use Pomodoro sprints?",
-        options=["Yes", "No"],
-        index=default_pomodoro_index,
-        placeholder="Choose yes or no",
-        key=f"open_task_pomodoro_{task_row['instance_id']}",
-    )
-    body_doubling_choice = st.selectbox(
-        "Use Body-Doubling?",
-        options=["Yes", "No"],
-        index=default_body_doubling_index,
-        placeholder="Choose yes or no",
-        key=f"open_task_body_doubling_{task_row['instance_id']}",
-    )
     reopen_start_at = None
     reopen_due_at = None
     requires_historical_clone = task_row.get("status") in {"stale", "completed"}
@@ -7390,59 +7153,70 @@ def open_task_dialog(task_row):
         else:
             reopen_start_at = reopened_start_at_value.isoformat()
             reopen_due_at = reopened_due_at_value.isoformat()
-    timing_notice_placeholder = st.empty()
-    if pomodoro_choice == "Yes" and body_doubling_choice == "Yes":
-        timing_notice_placeholder.info(
-            "Pomodoro will manage the timer. Body-Doubling will handle supportive guidance and review without starting a second countdown."
-        )
-    elif (
+    if (
         current_adaptation
         and current_adaptation.force_body_doubling_pomodoro_timing
-        and body_doubling_choice == "Yes"
     ):
-        timing_notice_placeholder.info(
-            "For this adaptive context, Body-Doubling will use Pomodoro timing automatically."
+        st.info(
+            "If you choose Body-Doubling in this adaptive context, the app may still apply Pomodoro timing automatically."
         )
-    else:
-        timing_notice_placeholder.empty()
 
-    open_button_col, cancel_button_col = st.columns(2, gap="small")
+    def start_open_task_with_mode(
+        pomodoro_choice,
+        body_doubling_choice,
+    ):
+        if opening_blocked:
+            return
 
-    with open_button_col:
+        try:
+            context = build_open_task_context(
+                task_row,
+                pomodoro_choice,
+                body_doubling_choice,
+                reopened_start_at=reopen_start_at,
+                reopened_due_at=reopen_due_at,
+            )
+            if requires_historical_clone and (not reopen_start_at or not reopen_due_at):
+                return
+            existing_open_task = get_open_task_row(
+                exclude_instance_id=task_row["instance_id"]
+            )
+            if existing_open_task:
+                context["existing_open_task"] = existing_open_task
+                st.session_state[OPEN_TASK_PENDING_CONTEXT_KEY] = context
+                st.rerun()
+
+            queue_open_task_start(context)
+            st.rerun()
+        except Exception as e:
+            handle_api_exception(e, f"Could not open task: {e}")
+
+    open_pomodoro_col, open_chunks_col, open_body_doubling_col, cancel_button_col = st.columns(4, gap="small")
+
+    with open_pomodoro_col:
         if st.button(
-            "OK",
+            "Use Pomodoro",
             type="primary",
             use_container_width=True,
-            key=f"open_task_ok_{task_row['instance_id']}",
+            key=f"open_task_pomodoro_{task_row['instance_id']}",
         ):
-            if pomodoro_choice is None or body_doubling_choice is None:
-                st.error("Please answer both questions before opening the task.")
-                return
-            if opening_blocked:
-                return
+            start_open_task_with_mode("Yes", "No")
 
-            try:
-                context = build_open_task_context(
-                    task_row,
-                    pomodoro_choice,
-                    body_doubling_choice,
-                    reopened_start_at=reopen_start_at,
-                    reopened_due_at=reopen_due_at,
-                )
-                if requires_historical_clone and (not reopen_start_at or not reopen_due_at):
-                    return
-                existing_open_task = get_open_task_row(
-                    exclude_instance_id=task_row["instance_id"]
-                )
-                if existing_open_task:
-                    context["existing_open_task"] = existing_open_task
-                    st.session_state[OPEN_TASK_PENDING_CONTEXT_KEY] = context
-                    st.rerun()
+    with open_chunks_col:
+        if st.button(
+            "Use Time Chunks",
+            use_container_width=True,
+            key=f"open_task_chunks_{task_row['instance_id']}",
+        ):
+            start_open_task_with_mode("No", "No")
 
-                queue_open_task_start(context)
-                st.rerun()
-            except Exception as e:
-                handle_api_exception(e, f"Could not open task: {e}")
+    with open_body_doubling_col:
+        if st.button(
+            "Use Body-Doubling",
+            use_container_width=True,
+            key=f"open_task_body_doubling_{task_row['instance_id']}",
+        ):
+            start_open_task_with_mode("No", "Yes")
 
     with cancel_button_col:
         if st.button(
@@ -7562,260 +7336,55 @@ def render_open_task_guidance_dialog():
     open_task_guidance_dialog()
 
 
-@st.dialog("Sprint review", on_dismiss=clear_sprint_review_state)
 def sprint_review_dialog():
-    """Render the review dialog shown after a Pomodoro sprint finishes."""
-
-    open_task = get_open_task_row()
-    if open_task:
-        st.subheader(open_task["title"])
-    else:
-        st.subheader("Pomodoro sprint finished")
-    task_complete_col, new_cycle_col, finish_col = st.columns(3, gap="small")
+    """Compatibility wrapper for the extracted Pomodoro sprint review dialog."""
 
     try:
-        with task_complete_col:
-            if st.button(
-                "Task complete",
-                key="sprint_review_task_complete",
-                type="primary",
-                use_container_width=True,
-            ):
-                if not open_task:
-                    st.warning("There is no open task to mark as completed.")
-                    return
-                request_task_completion_feedback(
-                    open_task,
-                    "sprint_review",
-                    rest_choice="No",
-                )
-                clear_sprint_review_state()
-                st.rerun()
-                return
-
-        with new_cycle_col:
-            if st.button(
-                "Continue",
-                key="sprint_review_new_cycle",
-                use_container_width=True,
-            ):
-                begin_pomodoro_rest_break(previous_work_outcome="incomplete")
-                clear_sprint_review_state()
-                st.rerun()
-                return
-
-        with finish_col:
-            if st.button(
-                "Finish",
-                key="sprint_review_finish",
-                use_container_width=True,
-            ):
-                disable_work_timer()
-                clear_pomodoro_overlay_state()
-                if open_task:
-                    next_status = get_post_work_incomplete_task_status(open_task)
-                    if next_status != "open":
-                        update_task_status(open_task, next_status)
-                notify_work_ended()
-                clear_sprint_review_state()
-                st.rerun()
-                return
+        pomodoro.sprint_review_dialog(get_pomodoro_services())
     except Exception as e:
         handle_api_exception(e, f"Could not finish sprint review: {e}")
 
 
 def render_sprint_review_dialog():
-    if st.session_state.get(SPRINT_REVIEW_PENDING_KEY):
-        sprint_review_dialog()
+    pomodoro.render_sprint_review_dialog(get_pomodoro_services())
 
 
-@st.dialog("Chunk review", on_dismiss=clear_chunk_review_state)
 def chunk_review_dialog():
-    """Render the review dialog shown after a generic work chunk finishes."""
+    """Compatibility wrapper for the extracted Chunk review dialog."""
 
-    st.markdown(
-        '<div class="review-status-note">Work cycle is over.</div>',
-        unsafe_allow_html=True,
-    )
-    current_adaptation, _ = get_current_task_adaptation(get_tasks_dataframe())
-    accumulated_chunk_seconds = get_chunk_continuous_work_seconds()
-    max_continuous_work_seconds = get_max_continuous_work_minutes() * 60
-    forced_rest_required = bool(
-        current_adaptation
-        and current_adaptation.protect_rest_breaks_with_messages
-        and accumulated_chunk_seconds >= max_continuous_work_seconds
-    )
-
-    if forced_rest_required:
-        st.info(
-            "A rest break is required now because your continuous Chunk work has reached the configured limit."
-        )
-
-    task_complete_col, new_cycle_col, finish_col = st.columns(3, gap="small")
-
-    try:
-        open_task = get_open_task_row()
-
-        with task_complete_col:
-            if st.button(
-                "Task complete",
-                key="chunk_review_task_complete",
-                type="primary",
-                use_container_width=True,
-            ):
-                if not open_task:
-                    st.warning("There is no open task to mark as completed.")
-                    return
-                request_task_completion_feedback(
-                    open_task,
-                    "chunk_review",
-                    continue_choice="No",
-                    forced_rest_required=forced_rest_required,
-                )
-                clear_chunk_review_state()
-                st.rerun()
-                return
-
-        with new_cycle_col:
-            if st.button(
-                "New cycle",
-                key="chunk_review_new_cycle",
-                use_container_width=True,
-            ):
-                if forced_rest_required:
-                    reset_chunk_continuous_work_seconds()
-                    begin_pomodoro_rest_break(
-                        previous_work_outcome="incomplete",
-                        resume_cycle_type="chunk",
-                    )
-                elif open_task:
-                    duration_seconds = get_next_chunk_work_seconds()
-                    schedule_work_timer(
-                        duration_seconds / 60.0,
-                        eoChunk,
-                        "chunk_review_restart_work_cycle",
-                    )
-                    start_chunk_overlay(open_task, duration_seconds)
-                else:
-                    disable_work_timer()
-                    clear_pomodoro_overlay_state()
-                clear_chunk_review_state()
-                st.rerun()
-                return
-
-        with finish_col:
-            if st.button(
-                "Finish",
-                key="chunk_review_finish",
-                use_container_width=True,
-            ):
-                clear_task_completion_feedback_request()
-                disable_work_timer()
-                clear_pomodoro_overlay_state()
-                if open_task:
-                    next_status = get_post_work_incomplete_task_status(open_task)
-                    if next_status != "open":
-                        update_task_status(open_task, next_status)
-                notify_work_ended()
-                clear_chunk_review_state()
-                st.rerun()
-                return
-    except Exception as e:
-        handle_api_exception(e, f"Could not finish chunk review: {e}")
+    chunk.chunk_review_dialog(get_chunk_services())
 
 
 def render_chunk_review_dialog():
-    if st.session_state.get(CHUNK_REVIEW_PENDING_KEY):
-        chunk_review_dialog()
+    chunk.render_chunk_review_dialog(get_chunk_services())
 
 
-@st.dialog("Rest")
 def rest_resume_prompt_dialog():
-    """Ask whether the user wants to resume work after a Pomodoro rest break."""
+    """Compatibility wrapper for the extracted rest-resume dialog."""
 
-    prompt_context = get_rest_resume_prompt_context() or {}
-    if not prompt_context:
-        return
-
-    display_message(
-        "POMODORO_REST_OVER_RESUME_WORK",
-        get_adaptive_message_intensity(),
-        renderer="info",
-    )
-
-    resume_col, finish_col = st.columns(2, gap="medium")
-    with resume_col:
-        if st.button("Resume work", key="rest_resume_work_button", type="primary", use_container_width=True):
-            resume_work_after_rest(prompt_context)
-            return
-    with finish_col:
-        if st.button("Finish", key="rest_finish_button", use_container_width=True):
-            finalize_post_rest_finish(prompt_context)
-            st.rerun()
+    pomodoro.rest_resume_prompt_dialog(get_pomodoro_services())
 
 
 def render_rest_resume_prompt_dialog():
     """Render the post-rest resume/finish decision dialog when pending."""
 
-    if st.session_state.get(REST_RESUME_PROMPT_PENDING_KEY):
-        rest_resume_prompt_dialog()
+    pomodoro.render_rest_resume_prompt_dialog(get_pomodoro_services())
 
 
 def resume_work_after_rest(prompt_context):
     """Resume work immediately after a Pomodoro-style rest break."""
 
-    open_task = get_open_task_row()
-    resume_cycle_type = (prompt_context or {}).get("resume_cycle_type") or "pomodoro"
-    work_duration_minutes = int(
-        (prompt_context or {}).get("work_duration_minutes")
-        or get_effective_pomodoro_sprint_minutes()
-    )
-    clear_rest_resume_prompt_context()
-    clear_rest_message()
-    if not open_task:
-        notify_work_ended()
-        st.rerun()
-        return
-    if resume_cycle_type == "chunk":
-        request_next_chunk_cycle(
-            open_task,
-            source_label="chunk_rest_resume_work",
-        )
-    else:
-        schedule_work_timer(
-            work_duration_minutes,
-            eoSprint,
-            "pomodoro_rest_resume_work",
-        )
-        start_pomodoro_overlay(open_task, work_duration_minutes)
-    st.rerun()
+    pomodoro.resume_work_after_rest(prompt_context, get_pomodoro_services())
 
 
-@st.dialog("Rest")
 def rest_message_dialog():
-    message = st.session_state.get(REST_MESSAGE_KEY)
-    if not message:
-        return
+    """Compatibility wrapper for the extracted rest message dialog."""
 
-    st.write(message)
-    render_voice_message_button(
-        message,
-        "rest_message",
-        modal_expiry_key=REST_MESSAGE_EXPIRES_AT_KEY,
-    )
-    st.caption("This message closes automatically, but voice playback keeps it open a bit longer.")
+    pomodoro.rest_message_dialog(get_pomodoro_services())
 
 
 def render_rest_message_dialog():
-    expires_at = st.session_state.get(REST_MESSAGE_EXPIRES_AT_KEY)
-    if expires_at is None:
-        return
-
-    if datetime.now(pytz.UTC).timestamp() >= float(expires_at):
-        clear_rest_message()
-        return
-
-    rest_message_dialog()
+    pomodoro.render_rest_message_dialog(get_pomodoro_services())
 
 
 def build_task_row_tooltip(row):
@@ -9234,6 +8803,16 @@ def render_sidebar():
 def registration_form():
     """Render the registration form for new users."""
 
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stDialog"] div[role="dialog"] {
+            width: min(1100px, 92vw);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.markdown('<span class="registration-form-anchor"></span>', unsafe_allow_html=True)
     with st.form("signup_form"):
         full_name = st.text_input("Full name") # Dato para tu tabla 'profiles'
@@ -9249,7 +8828,11 @@ def registration_form():
         )
         personas = get_personas()
         persona_options = {
-            persona["name"]: persona_id for persona_id, persona in personas.items()
+            (
+                f"{persona.get('name', 'Unnamed persona')} - "
+                f"{persona.get('self_describing', '').strip() or 'No self-description'}"
+            ): persona_id
+            for persona_id, persona in personas.items()
         }
         selected_persona_name = st.selectbox(
             "Persona",

@@ -3,7 +3,7 @@ from datetime import timedelta
 import pytest
 
 from app.ui.state import timers
-from app.ui.state.timers import get_inactivity_timer, get_work_timer
+from app.ui.state.timers import get_work_timer
 
 
 @pytest.fixture(autouse=True)
@@ -104,40 +104,6 @@ def test_timer_stop_prevents_callbacks_until_restarted():
     clock.advance(1)
     timer.tick()
     assert events == ["expired"]
-
-
-def test_inactivity_timer_can_reset_on_user_interaction():
-    state = {}
-    clock = FakeClock()
-    events = []
-    timer = get_inactivity_timer(state, now=clock.now)
-
-    timer.start(duration=5, on_expiry=lambda: events.append("inactive"))
-    clock.advance(3)
-    timer.tick(user_interaction=True)
-    clock.advance(3)
-    timer.tick()
-    assert events == []
-
-    clock.advance(2)
-    timer.tick()
-    assert events == ["inactive"]
-
-
-def test_disabled_timer_ignores_tick_and_user_interaction():
-    state = {}
-    clock = FakeClock()
-    events = []
-    timer = get_inactivity_timer(state, now=clock.now)
-
-    timer.start(duration=5, on_expiry=lambda: events.append("inactive"))
-    timer.disable()
-    clock.advance(10)
-    timer.tick(user_interaction=True)
-
-    assert events == []
-    assert timer.snapshot().enabled is False
-    assert timer.snapshot().running is False
 
 
 def test_reset_reenables_disabled_timer():

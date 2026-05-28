@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, MutableMapping
 
+from app.config import DEFAULT_PLANNER_TIMEOUT_MINUTES
+
 
 # Canonical state names persisted in the user-state log and shown in the UI.
 PLANNER_STATE = "Planner"
@@ -39,7 +41,7 @@ USER_FSM_PARAMETER_OVERRIDES_KEY = "user_state_machine_parameter_overrides"
 class UserStateMachineConfig:
     """Resolved runtime values for the behaviour parameters."""
 
-    planner_minutes: int = 3
+    planner_minutes: int = DEFAULT_PLANNER_TIMEOUT_MINUTES
     completed_tasks_threshold: int = 1
     completed_microsteps_threshold: int = 3
     rejected_tasks_threshold: int = 2
